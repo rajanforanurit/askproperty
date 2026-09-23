@@ -14,7 +14,7 @@ from config import settings
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Property Intelligence API", version="1.1.0")
+app = FastAPI(title="Ask Property Data Intelligence API", version="1.22.81")
 
 
 class CompareRequest(BaseModel):
@@ -40,6 +40,7 @@ def health():
     db_ok = check_connection()
     return {
         "status": "ok" if db_ok else "degraded",
+        "service":"Ask Property Data Intelligence API",
         "database_connected": db_ok,
         "cache_loaded": property_service._cache.is_loaded,
         "cache_age_seconds": round(property_service._cache.age_seconds, 1),
