@@ -1,6 +1,6 @@
 import logging
 from typing import Optional
-
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
@@ -70,6 +70,12 @@ def get_property(biz_key: str):
         raise HTTPException(status_code=404, detail=f"Property '{biz_key}' not found.")
     return record
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
 @app.get("/properties/{biz_key}/nearest")
 def nearest_properties(
