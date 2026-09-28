@@ -25,6 +25,11 @@ class Settings:
     ASK_AI_MODEL_NAME: str = os.getenv("ASK_AI_MODEL_NAME", "")
     ASK_AI_TIMEOUT_SECONDS: int = int(os.getenv("ASK_AI_TIMEOUT_SECONDS", "30"))
 
+    SECRET_KEY: str = os.getenv("SECRET_KEY", "")
+
+    SAVECHAT_URI: str = os.getenv("SAVECHAT_URI", "")
+    SAVECHAT_TIMEOUT_SECONDS: int = int(os.getenv("SAVECHAT_TIMEOUT_SECONDS", "30"))
+
 
 settings = Settings()
 
@@ -45,3 +50,13 @@ def validate_ask_ai_settings():
     ]
     if missing:
         raise RuntimeError(f"Missing required Ask AI environment variables: {', '.join(missing)}")
+
+
+def validate_secret_key_settings():
+    if not settings.SECRET_KEY:
+        raise RuntimeError("Missing required environment variable: SECRET_KEY")
+
+
+def validate_savechat_settings():
+    if not settings.SAVECHAT_URI:
+        raise RuntimeError("Missing required environment variable: SAVECHAT_URI")
