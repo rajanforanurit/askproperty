@@ -2,6 +2,7 @@ import json
 import logging
 import requests
 
+import financial_service
 from config import settings, validate_ask_ai_settings
 
 logger = logging.getLogger(__name__)
@@ -12,7 +13,8 @@ Given a user question, output ONLY a raw JSON object matching this schema, with 
 {
   "intent": "search" | "nearest" | "compare" | "unknown",
   "property_names": ["string", ...],
-  "nearby_count": integer or null
+  "nearby_count": integer or null,
+  "data_view": "actual" | "budget" | "both" | null
 }
 
 Rules:
@@ -21,6 +23,7 @@ Rules:
 - "compare": the user wants to compare two or more named properties, or one property against its nearest neighbors.
 - "unknown": the question does not fit any of the above categories.
 - property_names must be extracted exactly as the user typed them. Never invent or guess a property name that was not mentioned.
+- data_view: "actual" if the user asks about actual results or actuals, "budget" if the user asks about budget, forecast or planned figures, "both" if the user asks for actual versus budget, variance, or over/under budget. Use null if the question does not mention financial figures.
 - Respond with raw JSON only, nothing else."""
 
 
@@ -54,7 +57,7 @@ def _call_model(user_query: str) -> str:
 
 
 def _empty_result() -> dict:
-    return {"intent": "unknown", "property_names": [], "nearby_count": None}
+    return {"intent": "unknown", "property_names": [], "nearby_count": None, "data_view": None}
 
 
 def resolve_intent(user_query: str) -> dict:
@@ -91,4 +94,14 @@ def resolve_intent(user_query: str) -> dict:
     except (TypeError, ValueError):
         nearby_count = None
 
-    return {"intent": intent, "property_names": names, "nearby_count": nearby_count}
+    try:
+        data_view = financial_service.normalize_view(parsed.get("data_view"))
+    except ValueError:
+        data_view = None
+
+    return {
+        "intent": intent,
+        "property_names": names,
+        "nearby_count": nearby_count,
+        "data_view": data_view,
+    }
