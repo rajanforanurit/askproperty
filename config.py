@@ -4,6 +4,19 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _parse_int_list(value: str) -> list:
+    result = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            result.append(int(part))
+        except ValueError:
+            continue
+    return result
+
+
 class Settings:
     DB_SERVER: str = os.getenv("DB_SERVER", "")
     DB_NAME: str = os.getenv("DB_NAME", "")
@@ -13,7 +26,26 @@ class Settings:
 
     PRODUCT_TABLE: str = os.getenv("REBA_PRODUCT_TABLE", "Reba_Product")
 
+    FACTGL_TABLE: str = os.getenv("REBA_FACTGL_TABLE", "Reba_FactGL")
+    BUDGET_TABLE: str = os.getenv("REBA_BUDGET_TABLE", "Reba_Budget")
+    GL_ACCOUNT_TABLE: str = os.getenv("REBA_GL_ACCOUNT_TABLE", "Reba_GeneralLedgerAccount")
+    GL_BOOK_TABLE: str = os.getenv("REBA_GL_BOOK_TABLE", "Reba_GeneralLedgerBook")
+
+    FIN_PROPERTY_KEY_COLUMN: str = os.getenv("FIN_PROPERTY_KEY_COLUMN", "Property BizKey")
+    ACTUAL_VALUE_COLUMN: str = os.getenv("ACTUAL_VALUE_COLUMN", "Dollar")
+    BUDGET_VALUE_COLUMN: str = os.getenv("BUDGET_VALUE_COLUMN", "Budget")
+
+    ACTUAL_BOOK_KEYS: list = _parse_int_list(os.getenv("ACTUAL_BOOK_KEYS", ""))
+    BUDGET_BOOK_KEYS: list = _parse_int_list(os.getenv("BUDGET_BOOK_KEYS", ""))
+
+    GL_ACCOUNT_KEY_COLUMN: str = os.getenv("GL_ACCOUNT_KEY_COLUMN", "GLAccountKey")
+    GL_ACCOUNT_NAME_COLUMN: str = os.getenv("GL_ACCOUNT_NAME_COLUMN", "")
+    GL_ACCOUNT_CATEGORY_COLUMN: str = os.getenv("GL_ACCOUNT_CATEGORY_COLUMN", "")
+    GL_ACCOUNT_CODE_COLUMN: str = os.getenv("GL_ACCOUNT_CODE_COLUMN", "")
+
     CACHE_TTL_SECONDS: int = int(os.getenv("CACHE_TTL_SECONDS", "900"))
+    FINANCIAL_CACHE_TTL_SECONDS: int = int(os.getenv("FINANCIAL_CACHE_TTL_SECONDS", "900"))
+    FINANCIAL_CACHE_MAX_ENTRIES: int = int(os.getenv("FINANCIAL_CACHE_MAX_ENTRIES", "256"))
 
     ACTIVE_STATUSES: list = os.getenv("ACTIVE_STATUSES", "Active,Stabilizing,Lease-Up").split(",")
 
