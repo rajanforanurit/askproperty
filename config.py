@@ -42,6 +42,8 @@ class Settings:
     GL_ACCOUNT_NAME_COLUMN: str = os.getenv("GL_ACCOUNT_NAME_COLUMN", "")
     GL_ACCOUNT_CATEGORY_COLUMN: str = os.getenv("GL_ACCOUNT_CATEGORY_COLUMN", "")
     GL_ACCOUNT_CODE_COLUMN: str = os.getenv("GL_ACCOUNT_CODE_COLUMN", "")
+    GL_ACCOUNT_LEVEL2_COLUMN: str = os.getenv("GL_ACCOUNT_LEVEL2_COLUMN", "GL Account Level 2")
+    GL_ACCOUNT_LEVEL3_COLUMN: str = os.getenv("GL_ACCOUNT_LEVEL3_COLUMN", "GL Account Level 3")
 
     CACHE_TTL_SECONDS: int = int(os.getenv("CACHE_TTL_SECONDS", "900"))
     FINANCIAL_CACHE_TTL_SECONDS: int = int(os.getenv("FINANCIAL_CACHE_TTL_SECONDS", "900"))
