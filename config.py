@@ -1,8 +1,6 @@
 import os
 from dotenv import load_dotenv
-
 load_dotenv()
-
 
 def _parse_int_list(value: str) -> list:
     result = []
