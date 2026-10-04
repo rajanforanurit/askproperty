@@ -43,6 +43,8 @@ class Settings:
     GL_ACCOUNT_LEVEL2_COLUMN: str = os.getenv("GL_ACCOUNT_LEVEL2_COLUMN", "GL Account Level 2")
     GL_ACCOUNT_LEVEL3_COLUMN: str = os.getenv("GL_ACCOUNT_LEVEL3_COLUMN", "GL Account Level 3")
 
+    INCLUDE_UNMAPPED_ACCOUNTS: bool = os.getenv("INCLUDE_UNMAPPED_ACCOUNTS", "false").strip().lower() in ("1", "true", "yes")
+
     CACHE_TTL_SECONDS: int = int(os.getenv("CACHE_TTL_SECONDS", "900"))
     FINANCIAL_CACHE_TTL_SECONDS: int = int(os.getenv("FINANCIAL_CACHE_TTL_SECONDS", "900"))
     FINANCIAL_CACHE_MAX_ENTRIES: int = int(os.getenv("FINANCIAL_CACHE_MAX_ENTRIES", "256"))
