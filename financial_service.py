@@ -392,13 +392,42 @@ def _resolve_period(keys: list, ym_from, ym_to):
     return ym_from, ym_to
 
 
+def _apply_account_scope(frames: dict):
+    excluded = {}
+    notes = []
+    if settings.INCLUDE_UNMAPPED_ACCOUNTS:
+        return frames, excluded, notes
+
+    state = _gl_state()
+    if not state["loaded"]:
+        notes.append("GL account table is unavailable, so accounts outside the cash flow hierarchy could not be excluded.")
+        return frames, excluded, notes
+
+    known = list(state["lookup"].keys())
+    scoped = {}
+    for kind, frame in frames.items():
+        if frame.empty:
+            scoped[kind] = frame
+            excluded[kind] = {"accounts": 0, "amount": 0.0}
+            continue
+        mask = frame["GLAccountKey"].isin(known)
+        dropped = frame.loc[~mask]
+        excluded[kind] = {
+            "accounts": int(dropped["GLAccountKey"].nunique()),
+            "amount": round(float(dropped["Amount"].sum()), 2),
+        }
+        scoped[kind] = frame.loc[mask].reset_index(drop=True)
+    return scoped, excluded, notes
+
+
 def _load(view: str, keys: list, ym_from, ym_to):
     kinds = ["actual", "budget"] if view == "both" else [view]
     period = _resolve_period(keys, ym_from, ym_to)
     if period is None:
-        return None, {kind: _empty_frame() for kind in kinds}
+        return None, {kind: _empty_frame() for kind in kinds}, {}, []
     frames = {kind: _cached_amounts(kind, keys, period[0], period[1]) for kind in kinds}
-    return {"year_month_from": period[0], "year_month_to": period[1]}, frames
+    frames, excluded, notes = _apply_account_scope(frames)
+    return {"year_month_from": period[0], "year_month_to": period[1]}, frames, excluded, notes
 
 
 def _books_and_warnings(frames: dict):
@@ -541,8 +570,9 @@ def get_property_financials(biz_key, view=None, ym_from=None, ym_to=None, top_ac
     if key not in props:
         raise ValueError(f"Property '{key}' not found.")
 
-    period, frames = _load(view, [key], ym_from, ym_to)
+    period, frames, excluded, notes = _load(view, [key], ym_from, ym_to)
     books, warnings = _books_and_warnings(frames)
+    warnings = warnings + notes
     has_data = any(not frame.empty for frame in frames.values())
 
     totals = _amounts(_frame_total(frames, "actual"), _frame_total(frames, "budget"), view)
@@ -574,6 +604,7 @@ def get_property_financials(biz_key, view=None, ym_from=None, ym_to=None, top_ac
         "period": period,
         "books": books,
         "has_data": has_data,
+        "excluded_unmapped": excluded,
         "totals": totals,
         "summary": _summary_single(frames, view),
         "accounts": accounts,
@@ -605,8 +636,9 @@ def compare_financials(biz_keys, view=None, ym_from=None, ym_to=None, top_accoun
             "warnings": [],
         }
 
-    period, frames = _load(view, found, ym_from, ym_to)
+    period, frames, excluded, notes = _load(view, found, ym_from, ym_to)
     books, warnings = _books_and_warnings(frames)
+    warnings = warnings + notes
     has_data = any(not frame.empty for frame in frames.values())
 
     totals_map = {}
@@ -655,6 +687,7 @@ def compare_financials(biz_keys, view=None, ym_from=None, ym_to=None, top_accoun
         "view": view,
         "period": period,
         "books": books,
+        "excluded_unmapped": excluded,
         "properties": property_rows,
         "summary": _summary_matrix(frames, view, found),
         "accounts": account_rows,
@@ -687,6 +720,7 @@ def diagnostics() -> dict:
             "budget_value_column": settings.BUDGET_VALUE_COLUMN,
             "actual_book_keys": settings.ACTUAL_BOOK_KEYS,
             "budget_book_keys": settings.BUDGET_BOOK_KEYS,
+            "include_unmapped_accounts": settings.INCLUDE_UNMAPPED_ACCOUNTS,
         },
         "tables": {},
         "gl_accounts": {},
