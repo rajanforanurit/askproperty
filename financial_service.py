@@ -32,10 +32,27 @@ ACCOUNT_NAME_CANDIDATES = [
     "GLAccountName", "AccountName", "GLAccountDescription", "AccountDescription", "Description", "Name",
 ]
 ACCOUNT_CATEGORY_CANDIDATES = [
-    "GLAccountCategory", "AccountCategory", "GLAccountType", "AccountType",
+    "GL Account Level 2", "GLAccountCategory", "AccountCategory", "GLAccountType", "AccountType",
     "GLAccountGroup", "AccountGroup", "Category", "Type",
 ]
 ACCOUNT_CODE_CANDIDATES = ["GLAccountCode", "AccountCode", "GLAccountNumber", "AccountNumber"]
+
+SECTION_LABELS = {
+    "revenue": "Revenue",
+    "operating_expenses": "Operating Expenses",
+    "capital_expenses": "Capital Expenses",
+    "replacements": "Replacements",
+    "other": "Other",
+}
+
+SUMMARY_LINES = [
+    ("revenue", "Revenue"),
+    ("operating_expenses", "Operating Expenses"),
+    ("noi", "Net Operating Income"),
+    ("capital_expenses", "Capital Expenses"),
+    ("replacements", "Replacements"),
+    ("net_cash_flow", "Net Cash Flow After Capital"),
+]
 
 
 def normalize_view(value) -> Optional[str]:
@@ -101,6 +118,21 @@ def _records(df: pd.DataFrame) -> list:
     return df.astype(object).where(pd.notna(df), None).to_dict(orient="records")
 
 
+def _classify_section(level2, level3) -> str:
+    l2 = (level2 or "").lower()
+    l3 = (level3 or "").lower()
+    if "capital expense" in l2:
+        return "capital_expenses"
+    if "replacement" in l2:
+        return "replacements"
+    if "net operating income" in l2:
+        if "revenue" in l3:
+            return "revenue"
+        if "operating expense" in l3:
+            return "operating_expenses"
+    return "other"
+
+
 def _find_column(df, override, candidates, contains, exclude, taken):
     lookup = {str(c).lower(): c for c in df.columns}
     if override and override.strip().lower() in lookup:
@@ -146,19 +178,28 @@ def _load_gl_accounts() -> dict:
         taken.add(category_col)
     code_col = _find_column(df, settings.GL_ACCOUNT_CODE_COLUMN, ACCOUNT_CODE_CANDIDATES,
                             ["code", "number"], ["key", "book"], taken)
+    level2_col = _find_column(df, settings.GL_ACCOUNT_LEVEL2_COLUMN, ["GL Account Level 2"], [], [], set())
+    level3_col = _find_column(df, settings.GL_ACCOUNT_LEVEL3_COLUMN, ["GL Account Level 3"], [], [], set())
 
     work = df.copy()
     work["_account_key"] = pd.to_numeric(work[key_col], errors="coerce")
     work = work.dropna(subset=["_account_key"]).drop_duplicates(subset=["_account_key"])
 
     lookup = {}
+    section_counts = {}
     for record in work.to_dict(orient="records"):
         account_key = int(record["_account_key"])
         name = _text(record.get(name_col)) if name_col is not None else None
+        level2 = _text(record.get(level2_col)) if level2_col is not None else None
+        level3 = _text(record.get(level3_col)) if level3_col is not None else None
+        section = _classify_section(level2, level3)
+        section_counts[section] = section_counts.get(section, 0) + 1
         lookup[account_key] = {
             "GLAccountCode": _text(record.get(code_col)) if code_col is not None else None,
             "GLAccountName": name or f"Account {account_key}",
             "GLAccountCategory": _text(record.get(category_col)) if category_col is not None else None,
+            "GLAccountSection": SECTION_LABELS[section],
+            "_section": section,
         }
 
     state["loaded"] = True
@@ -168,7 +209,10 @@ def _load_gl_accounts() -> dict:
         "name": str(name_col) if name_col is not None else None,
         "category": str(category_col) if category_col is not None else None,
         "code": str(code_col) if code_col is not None else None,
+        "level2": str(level2_col) if level2_col is not None else None,
+        "level3": str(level3_col) if level3_col is not None else None,
     }
+    state["section_counts"] = section_counts
     return state
 
 
@@ -194,8 +238,20 @@ def _account_info(account_key) -> dict:
     account_key = int(account_key)
     info = _gl_state()["lookup"].get(account_key)
     if info is None:
-        return {"GLAccountCode": None, "GLAccountName": f"Account {account_key}", "GLAccountCategory": None}
-    return dict(info)
+        return {
+            "GLAccountCode": None,
+            "GLAccountName": f"Account {account_key}",
+            "GLAccountCategory": None,
+            "GLAccountSection": SECTION_LABELS["other"],
+        }
+    return {k: v for k, v in info.items() if not k.startswith("_")}
+
+
+def _section_key(account_key) -> str:
+    info = _gl_state()["lookup"].get(int(account_key))
+    if info is None:
+        return "other"
+    return info["_section"]
 
 
 def warm():
@@ -403,6 +459,74 @@ def _add_sort_column(df: pd.DataFrame, view: str) -> pd.DataFrame:
     return df
 
 
+def _ordered_lines(include_other: bool) -> list:
+    lines = list(SUMMARY_LINES)
+    if include_other:
+        lines.insert(len(lines) - 1, ("other", "Other / Unmapped"))
+    return lines
+
+
+def _section_pairs(frames: dict, by_property: bool) -> dict:
+    group_cols = ["PropertyBizKey", "Section"] if by_property else ["Section"]
+    tagged = {}
+    for kind, frame in frames.items():
+        copy = frame.copy()
+        copy["Section"] = copy["GLAccountKey"].map(_section_key).astype(object)
+        tagged[kind] = copy
+    table = _merge_amounts(tagged, group_cols)
+    pairs = {}
+    for record in table.to_dict(orient="records"):
+        owner = record["PropertyBizKey"] if by_property else ""
+        pairs.setdefault(owner, {})[record["Section"]] = (record.get("actual", 0.0), record.get("budget", 0.0))
+    return pairs
+
+
+def _line_values(section_pairs: dict) -> dict:
+    def pick(key):
+        return section_pairs.get(key, (0.0, 0.0))
+
+    revenue = pick("revenue")
+    opex = pick("operating_expenses")
+    return {
+        "revenue": revenue,
+        "operating_expenses": opex,
+        "noi": (revenue[0] + opex[0], revenue[1] + opex[1]),
+        "capital_expenses": pick("capital_expenses"),
+        "replacements": pick("replacements"),
+        "other": pick("other"),
+        "net_cash_flow": (
+            sum(p[0] for p in section_pairs.values()),
+            sum(p[1] for p in section_pairs.values()),
+        ),
+    }
+
+
+def _summary_single(frames: dict, view: str) -> list:
+    values = _line_values(_section_pairs(frames, False).get("", {}))
+    include_other = any(values["other"])
+    return [
+        {"key": key, "label": label, **_amounts(values[key][0], values[key][1], view)}
+        for key, label in _ordered_lines(include_other)
+    ]
+
+
+def _summary_matrix(frames: dict, view: str, keys: list) -> list:
+    pairs = _section_pairs(frames, True)
+    per_owner = {owner: _line_values(pairs.get(owner, {})) for owner in keys}
+    include_other = any(any(v["other"]) for v in per_owner.values())
+    rows = []
+    for key, label in _ordered_lines(include_other):
+        rows.append({
+            "key": key,
+            "label": label,
+            "values": {
+                owner: _amounts(per_owner[owner][key][0], per_owner[owner][key][1], view)
+                for owner in keys
+            },
+        })
+    return rows
+
+
 def _frame_total(frames: dict, kind: str) -> float:
     frame = frames.get(kind)
     if frame is None or frame.empty:
@@ -451,6 +575,7 @@ def get_property_financials(biz_key, view=None, ym_from=None, ym_to=None, top_ac
         "books": books,
         "has_data": has_data,
         "totals": totals,
+        "summary": _summary_single(frames, view),
         "accounts": accounts,
         "months": months,
         "warnings": warnings,
@@ -473,6 +598,7 @@ def compare_financials(biz_keys, view=None, ym_from=None, ym_to=None, top_accoun
             "period": None,
             "books": {},
             "properties": [],
+            "summary": [],
             "accounts": [],
             "not_found": not_found,
             "no_data": [],
@@ -530,6 +656,7 @@ def compare_financials(biz_keys, view=None, ym_from=None, ym_to=None, top_accoun
         "period": period,
         "books": books,
         "properties": property_rows,
+        "summary": _summary_matrix(frames, view, found),
         "accounts": account_rows,
         "not_found": not_found,
         "no_data": no_data,
@@ -602,6 +729,7 @@ def diagnostics() -> dict:
         "row_count": state["row_count"],
         "all_columns": state["all_columns"],
         "detected_columns": state["columns"],
+        "section_counts": state.get("section_counts", {}),
         "sample": [{"GLAccountKey": k, **v} for k, v in list(state["lookup"].items())[:5]],
         "error": state["error"],
     }
