@@ -1,4 +1,5 @@
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import pandas as pd
@@ -7,7 +8,7 @@ from sqlalchemy import bindparam, text
 import property_service
 from cache import KeyedTTLCache, TTLCache
 from config import settings
-from db import get_engine
+from db import get_engine, read_sql_retry, scalar_retry
 
 logger = logging.getLogger(__name__)
 
@@ -256,6 +257,11 @@ def _section_key(account_key) -> str:
 
 def warm():
     _gl_accounts_cache.get(force_refresh=True)
+    for kind in ("actual", "budget"):
+        try:
+            _max_month(kind)
+        except Exception as e:
+            logger.warning("Latest-month warm-up failed for %s: %s", kind, e)
 
 
 def refresh_now() -> dict:
@@ -330,7 +336,7 @@ def _fetch_amounts(kind: str, keys: list, ym_from: int, ym_to: int) -> pd.DataFr
 
     logger.info("Fetching %s amounts from %s for %d properties (%s-%s)",
                 kind, table, len(keys), ym_from, ym_to)
-    df = pd.read_sql(text(sql).bindparams(*expanding), get_engine(), params=params)
+    df = read_sql_retry(text(sql).bindparams(*expanding), params)
 
     if df.empty:
         return _empty_frame()
@@ -352,40 +358,51 @@ def _cached_amounts(kind: str, keys: list, ym_from: int, ym_to: int) -> pd.DataF
     return _data_cache.get(cache_key, lambda: _fetch_amounts(kind, keys, ym_from, ym_to))
 
 
-def _max_month(kind: str, keys: list) -> Optional[int]:
+class _NoMonth(Exception):
+    pass
+
+
+def _max_month(kind: str, keys: Optional[list] = None) -> Optional[int]:
+    """Latest YearMonthKey in the actual/budget table (cached; warmed at startup)."""
     table, _, books = _source(kind)
-    pk = _quote_column(settings.FIN_PROPERTY_KEY_COLUMN)
 
-    sql = f"SELECT MAX(YearMonthKey) FROM {_quote_table(table)} WHERE {pk} IN :keys"
-    params = {"keys": list(keys)}
-    expanding = [bindparam("keys", expanding=True)]
-
+    sql = f"SELECT MAX(YearMonthKey) FROM {_quote_table(table)}"
+    params = {}
+    statement = None
     if books:
-        sql += " AND GLBookKey IN :books"
+        sql += " WHERE GLBookKey IN :books"
         params["books"] = list(books)
-        expanding.append(bindparam("books", expanding=True))
+        statement = text(sql).bindparams(bindparam("books", expanding=True))
+    else:
+        statement = text(sql)
 
     def loader():
-        with get_engine().connect() as conn:
-            value = conn.execute(text(sql).bindparams(*expanding), params).scalar()
-        return int(value) if value is not None else None
+        value = scalar_retry(statement, params)
+        if value is None:
+            raise _NoMonth()
+        return int(value)
 
-    return _data_cache.get(("max_month", kind, tuple(sorted(keys))), loader)
-
-
-def _latest_month(keys: list) -> Optional[int]:
-    latest = _max_month("actual", keys)
-    if latest is None:
-        latest = _max_month("budget", keys)
-    return latest
+    try:
+        return _data_cache.get(("max_month", kind), loader)
+    except _NoMonth:
+        return None
 
 
-def _resolve_period(keys: list, ym_from, ym_to):
+def _latest_month(keys: list, view: Optional[str] = None) -> Optional[int]:
+    order = ["budget", "actual"] if view == "budget" else ["actual", "budget"]
+    for kind in order:
+        latest = _max_month(kind, keys)
+        if latest is not None:
+            return latest
+    return None
+
+
+def _resolve_period(keys: list, ym_from, ym_to, view: Optional[str] = None):
     ym_from = _validate_month(ym_from, "year_month_from") if ym_from is not None else None
     ym_to = _validate_month(ym_to, "year_month_to") if ym_to is not None else None
 
     if ym_to is None:
-        ym_to = _latest_month(keys)
+        ym_to = _latest_month(keys, view)
         if ym_to is None:
             return None
     if ym_from is None:
@@ -425,10 +442,15 @@ def _apply_account_scope(frames: dict):
 
 def _load(view: str, keys: list, ym_from, ym_to):
     kinds = ["actual", "budget"] if view == "both" else [view]
-    period = _resolve_period(keys, ym_from, ym_to)
+    period = _resolve_period(keys, ym_from, ym_to, view)
     if period is None:
         return None, {kind: _empty_frame() for kind in kinds}, {}, []
-    frames = {kind: _cached_amounts(kind, keys, period[0], period[1]) for kind in kinds}
+    if len(kinds) > 1:
+        with ThreadPoolExecutor(max_workers=len(kinds)) as pool:
+            futures = {kind: pool.submit(_cached_amounts, kind, keys, period[0], period[1]) for kind in kinds}
+            frames = {kind: futures[kind].result() for kind in kinds}
+    else:
+        frames = {kinds[0]: _cached_amounts(kinds[0], keys, period[0], period[1])}
     frames, excluded, notes = _apply_account_scope(frames)
     return {"year_month_from": period[0], "year_month_to": period[1]}, frames, excluded, notes
 
@@ -503,7 +525,8 @@ def _section_pairs(frames: dict, by_property: bool) -> dict:
     tagged = {}
     for kind, frame in frames.items():
         copy = frame.copy()
-        copy["Section"] = copy["GLAccountKey"].map(_section_key).astype(object)
+        sections = {key: info["_section"] for key, info in _gl_state()["lookup"].items()}
+        copy["Section"] = copy["GLAccountKey"].map(lambda k: sections.get(int(k), "other")).astype(object)
         tagged[kind] = copy
     table = _merge_amounts(tagged, group_cols)
     pairs = {}
