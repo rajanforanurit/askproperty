@@ -309,6 +309,51 @@ def filter_properties(constraints: list, active_only: Optional[bool] = None, lim
     return {"results": rows, "applied_constraints": applied, "unsupported_constraints": unsupported, "total_matches": total, "limit": limit}
 
 
+ALWAYS_FIELDS = ["PropertyBizKey", "PropertyName"]
+MAP_FIELDS = ["Latitude", "Longitude"]
+MAX_FIELDS = 12
+
+
+def sanitize_fields(raw):
+    """Validate the attribute names the model says the user wants shown/compared.
+
+    Returns (fields, unsupported). `fields` is [] when the user named no valid
+    attributes, so callers fall back to the default comparison fields.
+    """
+    if not isinstance(raw, list) or not raw:
+        return [], []
+
+    allowed = {
+        _canon(key): key
+        for key, _label, _kind in TABLE_COLUMNS
+        if key not in ALWAYS_FIELDS and key != "distance_miles"
+    }
+    allowed.update({_canon(key): key for key in FILTER_FIELDS})
+
+    chosen = []
+    unsupported = []
+    for item in raw:
+        if not isinstance(item, str) or not item.strip():
+            continue
+        key = allowed.get(_canon(item))
+        if key is None:
+            close = difflib.get_close_matches(_canon(item), list(allowed), n=1, cutoff=0.85)
+            key = allowed[close[0]] if close else None
+        if key is None:
+            if len(unsupported) < MAX_FLAGGED:
+                unsupported.append(f"Attribute '{item.strip()}' is not available in the property data")
+            continue
+        if key not in chosen:
+            chosen.append(key)
+
+    if not chosen:
+        return [], unsupported
+
+    chosen = chosen[:MAX_FIELDS]
+    fields = list(ALWAYS_FIELDS) + chosen + [f for f in MAP_FIELDS if f not in chosen]
+    return fields, unsupported
+
+
 def _valid_coords(record: dict) -> bool:
     lat, lng = record.get("Latitude"), record.get("Longitude")
     return isinstance(lat, (int, float)) and isinstance(lng, (int, float)) and lat == lat and lng == lng
@@ -333,13 +378,16 @@ def build_markers(subject: Optional[dict], others: list, role: str) -> list:
     return markers
 
 
-def build_table(subject: Optional[dict], others: list) -> dict:
+def build_table(subject: Optional[dict], others: list, fields: Optional[list] = None) -> dict:
     records = ([subject] if subject else []) + list(others)
     has_distance = any(clean_record(r).get("distance_miles") is not None for r in records)
+    wanted = None
+    if fields:
+        wanted = set(fields) | {"PropertyName"}
     columns = [
         {"key": key, "label": label, "type": kind}
         for key, label, kind in TABLE_COLUMNS
-        if key != "distance_miles" or has_distance
+        if (key != "distance_miles" or has_distance) and (wanted is None or key in wanted or key == "distance_miles")
     ]
     rows = []
     for index, record in enumerate(records):
@@ -364,6 +412,7 @@ def build_task(
     applied: list,
     unsupported: list,
     notes: list,
+    fields: Optional[list] = None,
 ) -> dict:
     markers = build_markers(subject, others, role)
     total = len(others) + (1 if subject else 0)
@@ -383,5 +432,5 @@ def build_task(
             "notes": notes,
         },
         "markers": markers,
-        "table": build_table(subject, others),
+        "table": build_table(subject, others, fields),
     }
