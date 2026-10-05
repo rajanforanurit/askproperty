@@ -12,6 +12,7 @@ import property_service
 import geo_service
 import comparison_service
 import financial_service
+import query_service
 import ai_service
 from db import check_connection
 from config import settings, validate_secret_key_settings, validate_savechat_settings
@@ -34,6 +35,7 @@ class CompareRequest(BaseModel):
 class AskAIRequest(BaseModel):
     query: str
     view: Optional[str] = None
+    context_property_key: Optional[str] = None
     year_month_from: Optional[int] = None
     year_month_to: Optional[int] = None
     top_accounts: Optional[int] = None
@@ -241,20 +243,118 @@ def compare_with_nearest(
     return response
 
 
+MAX_FINANCIAL_PROPERTIES = 25
+
+
+def _dedupe(items: list) -> list:
+    seen = []
+    for item in items:
+        if item and item not in seen:
+            seen.append(item)
+    return seen
+
+
+def _find_nearby(target_key: str, count: Optional[int], radius: Optional[float], constraints: list) -> dict:
+    try:
+        if radius is None and not constraints:
+            result = geo_service.find_nearest_properties(target_key, count=count)
+            return {
+                "target": query_service.clean_record(result["target"]),
+                "nearby": [query_service.clean_record(r) for r in result["nearby"]],
+                "applied": [],
+                "unsupported": [],
+            }
+        result = geo_service.find_relevant_properties(
+            target_key, count=count, max_distance_miles=radius, constraints=constraints,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {
+        "target": result["target"],
+        "nearby": result["nearby"],
+        "applied": result["applied_constraints"],
+        "unsupported": result["unsupported_constraints"],
+    }
+
+
+def _task_notes(count: Optional[int], returned: int, radius: Optional[float], applied: list, unsupported: list) -> list:
+    notes = []
+    if unsupported:
+        notes.append(
+            "These conditions could not be applied because the property data has no matching field or value: "
+            + "; ".join(unsupported) + "."
+        )
+    if returned == 0:
+        notes.append("No properties matched the request.")
+    elif count and returned < count:
+        where = f" within {radius:g} miles" if radius else ""
+        extra = " and your conditions" if applied else ""
+        noun = "property" if returned == 1 else "properties"
+        notes.append(f"Only {returned} {noun} matched{where}{extra}.")
+    return notes
+
+
+def _financial_bundle(keys: list, view: Optional[str], req: "AskAIRequest") -> tuple:
+    if not view:
+        return {}, []
+    limited = keys[:MAX_FINANCIAL_PROPERTIES]
+    notes = []
+    if len(keys) > len(limited):
+        notes.append(f"Financial figures are shown for the first {len(limited)} of {len(keys)} properties.")
+    payload = _financial_payload(limited, view, req.year_month_from, req.year_month_to, req.top_accounts)
+    return payload, notes
+
+
+def _unknown_response(task_id: str, parsed: dict, message: str) -> dict:
+    return {
+        "intent": "unknown",
+        "message": message,
+        "raw": parsed,
+        "task": {"id": task_id, "kind": "unknown", "notes": [message]},
+        "markers": [],
+        "table": {"columns": [], "rows": []},
+    }
+
+
 @app.post("/ask-ai", dependencies=[Depends(verify_secret_key)])
 def ask_ai(req: AskAIRequest):
     button_view = _resolve_view(req.view)
-    parsed = ai_service.resolve_intent(req.query)
+    parsed = ai_service.resolve_intent(req.query, query_service.catalog_prompt())
     intent = parsed["intent"]
     names = parsed["property_names"]
     view = button_view or parsed.get("data_view")
+    task_id = query_service.new_task_id()
+    radius = parsed.get("max_distance_miles")
+    count = parsed.get("nearby_count")
+    constraints, flagged = query_service.sanitize_constraints(parsed.get("constraints"), parsed.get("unsupported"))
+    fields, unsupported_fields = query_service.sanitize_fields(parsed.get("fields"))
+    flagged = _dedupe(flagged + unsupported_fields)
+    context_key = (req.context_property_key or "").strip()
 
-    if intent == "unknown" or not names:
-        return {
-            "intent": "unknown",
-            "message": "Could not understand the request. Try rephrasing or specify a property name.",
-            "raw": parsed,
-        }
+    generic_message = "Could not understand the request. Try rephrasing or specify a property name."
+
+    if intent == "unknown":
+        return _unknown_response(task_id, parsed, generic_message)
+
+    if intent == "list" and not names:
+        if not constraints:
+            return _unknown_response(task_id, parsed, generic_message)
+        listing = query_service.filter_properties(constraints, limit=count)
+        rows = listing["results"]
+        unsupported = _dedupe(flagged + listing["unsupported_constraints"])
+        keys = [str(r["PropertyBizKey"]) for r in rows]
+        financials, fin_notes = _financial_bundle(keys, view, req)
+        notes = _task_notes(count, len(rows), None, listing["applied_constraints"], unsupported) + fin_notes
+        if listing["total_matches"] > len(rows):
+            notes.append(f"Showing {len(rows)} of {listing['total_matches']} matching properties.")
+        task = query_service.build_task(
+            task_id, "list", None, rows, "result", view, None, count,
+            listing["applied_constraints"], unsupported, notes, fields,
+        )
+        return {"intent": "search", "results": rows, "unresolved": [], **task, **financials}
+
+    if intent != "list" and not names and not context_key:
+        return _unknown_response(task_id, parsed, generic_message)
 
     resolved = []
     unresolved = []
@@ -265,69 +365,86 @@ def ask_ai(req: AskAIRequest):
         else:
             unresolved.append(name)
 
+    if not names and context_key:
+        context = property_service.get_by_bizkey(context_key)
+        if context is not None:
+            resolved = [context]
+
     if not resolved:
+        label = ", ".join(names) if names else context_key
         return {
-            "intent": intent,
-            "message": f"No properties found matching: {', '.join(names)}",
+            "intent": intent if intent != "list" else "search",
+            "message": f"No properties found matching: {label}",
             "unresolved": unresolved,
+            "task": {"id": task_id, "kind": intent, "notes": [f"No properties found matching: {label}"]},
+            "markers": [],
+            "table": {"columns": [], "rows": []},
         }
 
-    if intent == "search":
-        keys = [p["PropertyBizKey"] for p in resolved]
+    effective = "nearest" if intent == "list" else intent
+
+    if effective == "search":
+        subject = resolved[0] if len(resolved) == 1 else None
+        others = [] if subject else resolved
+        keys = [str(p["PropertyBizKey"]) for p in resolved]
+        financials, fin_notes = _financial_bundle(keys, view, req)
+        task = query_service.build_task(
+            task_id, "search", subject, others, "result", view, None, None, [], flagged, fin_notes, fields,
+        )
+        return {"intent": "search", "results": resolved, "unresolved": unresolved, **task, **financials}
+
+    if effective == "nearest":
+        found = _find_nearby(resolved[0]["PropertyBizKey"], count, radius, constraints)
+        unsupported = _dedupe(flagged + found["unsupported"])
+        keys = [str(found["target"]["PropertyBizKey"])] + [str(p["PropertyBizKey"]) for p in found["nearby"]]
+        financials, fin_notes = _financial_bundle(keys, view, req)
+        notes = _task_notes(count, len(found["nearby"]), radius, found["applied"], unsupported) + fin_notes
+        task = query_service.build_task(
+            task_id, "nearest", found["target"], found["nearby"], "nearby", view, radius, count,
+            found["applied"], unsupported, notes, fields,
+        )
         return {
-            "intent": intent,
-            "results": resolved,
+            "intent": "nearest",
+            "target": found["target"],
+            "nearby": found["nearby"],
             "unresolved": unresolved,
-            **_financial_payload(keys, view, req.year_month_from, req.year_month_to, req.top_accounts),
+            **task,
+            **financials,
         }
 
-    if intent == "nearest":
-        target = resolved[0]
-        try:
-            result = geo_service.find_nearest_properties(
-                target["PropertyBizKey"], count=parsed["nearby_count"]
-            )
-        except ValueError as e:
-            raise HTTPException(status_code=404, detail=str(e))
-        keys = [result["target"]["PropertyBizKey"]] + [p["PropertyBizKey"] for p in result["nearby"]]
-        return {
-            "intent": intent,
-            **result,
-            "unresolved": unresolved,
-            **_financial_payload(keys, view, req.year_month_from, req.year_month_to, req.top_accounts),
-        }
-
-    if intent == "compare":
+    if effective == "compare":
         if len(resolved) >= 2:
-            biz_keys = [p["PropertyBizKey"] for p in resolved]
-            comparison = comparison_service.build_comparison(biz_keys)
-            return {
-                "intent": intent,
-                "comparison": comparison,
-                "unresolved": unresolved,
-                **_financial_payload(biz_keys, view, req.year_month_from, req.year_month_to, req.top_accounts),
-            }
-
-        target = resolved[0]
-        try:
-            nearest = geo_service.find_nearest_properties(
-                target["PropertyBizKey"], count=parsed["nearby_count"]
+            biz_keys = [str(p["PropertyBizKey"]) for p in resolved]
+            comparison = comparison_service.build_comparison(biz_keys, fields=fields)
+            financials, fin_notes = _financial_bundle(biz_keys, view, req)
+            task = query_service.build_task(
+                task_id, "compare", query_service.clean_record(resolved[0]),
+                [query_service.clean_record(p) for p in resolved[1:]], "comparison",
+                view, None, None, [], flagged, fin_notes, fields,
             )
-        except ValueError as e:
-            raise HTTPException(status_code=404, detail=str(e))
+            return {"intent": "compare", "comparison": comparison, "unresolved": unresolved, **task, **financials}
 
-        all_keys = [nearest["target"]["PropertyBizKey"]] + [p["PropertyBizKey"] for p in nearest["nearby"]]
-        comparison = comparison_service.build_comparison(all_keys)
+        found = _find_nearby(resolved[0]["PropertyBizKey"], count, radius, constraints)
+        unsupported = _dedupe(flagged + found["unsupported"])
+        all_keys = [str(found["target"]["PropertyBizKey"])] + [str(p["PropertyBizKey"]) for p in found["nearby"]]
+        comparison = comparison_service.build_comparison(all_keys, fields=fields)
+        financials, fin_notes = _financial_bundle(all_keys, view, req)
+        notes = _task_notes(count, len(found["nearby"]), radius, found["applied"], unsupported) + fin_notes
+        task = query_service.build_task(
+            task_id, "compare", found["target"], found["nearby"], "comparison", view, radius, count,
+            found["applied"], unsupported, notes, fields,
+        )
         return {
-            "intent": intent,
-            "target": nearest["target"],
-            "nearby": nearest["nearby"],
+            "intent": "compare",
+            "target": found["target"],
+            "nearby": found["nearby"],
             "comparison": comparison,
             "unresolved": unresolved,
-            **_financial_payload(all_keys, view, req.year_month_from, req.year_month_to, req.top_accounts),
+            **task,
+            **financials,
         }
 
-    return {"intent": "unknown"}
+    return _unknown_response(task_id, parsed, generic_message)
 
 
 @app.post("/save-chat", dependencies=[Depends(verify_secret_key)])
