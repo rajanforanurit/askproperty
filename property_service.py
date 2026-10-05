@@ -44,6 +44,36 @@ def _load_properties_from_db() -> pd.DataFrame:
 _cache = TTLCache(ttl_seconds=settings.CACHE_TTL_SECONDS, loader=_load_properties_from_db, name="properties")
 
 
+def _load_units() -> dict:
+    """PropertyBizKey -> unit count, read from the product table.
+
+    Kept separate from the main property load so a missing/misnamed units
+    column can never break the rest of the app. Set UNITS_COLUMN to change it.
+    """
+    column = (settings.UNITS_COLUMN or "").strip().strip("[]")
+    if not column:
+        return {}
+    query = f"SELECT [PropertyBizKey], [{column}] AS Units FROM [{settings.PRODUCT_TABLE}]"
+    try:
+        df = pd.read_sql(text(query), get_engine())
+    except Exception as e:
+        logger.warning("Unit counts unavailable (column '%s'): %s", column, e)
+        return {}
+
+    df["PropertyBizKey"] = df["PropertyBizKey"].astype(str).str.strip()
+    df["Units"] = pd.to_numeric(df["Units"], errors="coerce")
+    df = df.dropna(subset=["Units"])
+    df = df[df["Units"] > 0]
+    return {row.PropertyBizKey: float(row.Units) for row in df.itertuples(index=False)}
+
+
+_units_cache = TTLCache(ttl_seconds=settings.CACHE_TTL_SECONDS, loader=_load_units, name="units")
+
+
+def get_units_map() -> dict:
+    return _units_cache.get()
+
+
 def get_all_properties(active_only: bool = False, force_refresh: bool = False) -> pd.DataFrame:
     df = _cache.get(force_refresh=force_refresh)
     if active_only:
@@ -81,4 +111,5 @@ def search_by_name(query: str, limit: int = 5, active_only: bool = False) -> lis
 
 
 def refresh_now():
+    _units_cache.get(force_refresh=True)
     return get_all_properties(force_refresh=True)
