@@ -321,6 +321,8 @@ def ask_ai(req: AskAIRequest):
     intent = parsed["intent"]
     names = parsed["property_names"]
     view = button_view or parsed.get("data_view")
+    if intent == "compare" and not view:
+        view = "actual"
     task_id = query_service.new_task_id()
     radius = parsed.get("max_distance_miles")
     count = parsed.get("nearby_count")
