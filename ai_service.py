@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+import time
 import requests
 import financial_service
 from config import settings, validate_ask_ai_settings
@@ -162,9 +163,29 @@ def _positive_float(value):
     return min(number, 500.0)
 
 
+def _is_transient(error: Exception) -> bool:
+    if isinstance(error, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+        return True
+    if isinstance(error, requests.exceptions.HTTPError) and error.response is not None:
+        return error.response.status_code in (408, 409, 425, 429, 500, 502, 503, 504)
+    return False
+
+
+def _call_model_with_retry(user_query: str, catalog: str, attempts: int = 2) -> str:
+    for attempt in range(1, attempts + 1):
+        try:
+            return _call_model(user_query, catalog)
+        except Exception as e:
+            if attempt >= attempts or not _is_transient(e):
+                raise
+            logger.warning("Ask AI model call failed (attempt %d/%d), retrying: %s", attempt, attempts, e)
+            time.sleep(1.0)
+    return ""
+
+
 def resolve_intent(user_query: str, catalog: str = "") -> dict:
     try:
-        raw = _call_model(user_query, catalog)
+        raw = _call_model_with_retry(user_query, catalog)
     except Exception as e:
         logger.error("Ask AI model call failed: %s", e)
         return _empty_result()
