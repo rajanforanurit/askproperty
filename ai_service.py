@@ -2,7 +2,6 @@ import json
 import logging
 import re
 import requests
-
 import financial_service
 from config import settings, validate_ask_ai_settings
 
