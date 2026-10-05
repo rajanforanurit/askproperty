@@ -1,5 +1,8 @@
 import logging
-from typing import Optional
+import math
+from typing import Any, Optional
+
+import pandas as pd
 
 import financial_service
 from property_service import get_by_bizkey
@@ -21,6 +24,40 @@ DEFAULT_COMPARISON_FIELDS = [
     "Latitude",
     "Longitude",
 ]
+
+
+def _clean_value(value: Any) -> Any:
+    """Convert pandas/numpy values into JSON-safe Python values.
+
+    NaN / NaT / pd.NA / +-inf become None so FastAPI can serialise the response.
+    """
+    if value is None:
+        return None
+
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        # pd.isna on list-like values returns an array; treat those as non-null
+        pass
+
+    if hasattr(value, "item"):
+        try:
+            value = value.item()
+        except (ValueError, AttributeError):
+            pass
+
+    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+        return None
+
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+
+    return value
+
+
+def _clean_record(record: dict) -> dict:
+    return {key: _clean_value(val) for key, val in record.items()}
 
 
 def financial_payload(
@@ -74,6 +111,7 @@ def build_comparison(
         if record is None:
             not_found.append(key)
             continue
+        record = _clean_record(record)
         found_keys.append(str(record["PropertyBizKey"]))
         rows.append({field: record.get(field) for field in fields})
 
