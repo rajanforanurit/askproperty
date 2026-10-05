@@ -22,6 +22,7 @@ class Settings:
     DB_DRIVER: str = os.getenv("DB_DRIVER", "pymssql")
 
     PRODUCT_TABLE: str = os.getenv("REBA_PRODUCT_TABLE", "Reba_Product")
+    UNITS_COLUMN: str = os.getenv("UNITS_COLUMN", "NumberOfUnits")
 
     FACTGL_TABLE: str = os.getenv("REBA_FACTGL_TABLE", "Reba_FactGL")
     BUDGET_TABLE: str = os.getenv("REBA_BUDGET_TABLE", "Reba_Budget")
