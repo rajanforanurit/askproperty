@@ -4,6 +4,7 @@ import pandas as pd
 
 from property_service import get_all_properties, get_by_bizkey
 from config import settings
+import query_service
 
 logger = logging.getLogger(__name__)
 
@@ -63,3 +64,58 @@ def find_nearest_properties(
         "target": target,
         "nearby": nearest.to_dict(orient="records"),
     }
+
+
+def find_relevant_properties(
+    target_biz_key: str,
+    count: int = None,
+    max_distance_miles: float = None,
+    constraints: list = None,
+    active_only: bool = None,
+) -> dict:
+    target = get_by_bizkey(target_biz_key)
+    if target is None:
+        raise ValueError(f"Property with PropertyBizKey '{target_biz_key}' not found.")
+
+    if pd.isna(target.get("Latitude")) or pd.isna(target.get("Longitude")):
+        raise ValueError(
+            f"Property '{target.get('PropertyName')}' ({target_biz_key}) has no coordinates on file."
+        )
+
+    constraints = constraints or []
+    if active_only is None:
+        active_only = not any(c["field"] == "PropertyStatus" for c in constraints)
+
+    cap = settings.RADIUS_RESULT_CAP if max_distance_miles else settings.MAX_NEARBY_COUNT
+    requested = count or (cap if max_distance_miles else settings.DEFAULT_NEARBY_COUNT)
+    limit = max(1, min(int(requested), cap))
+
+    df = get_all_properties(active_only=active_only).dropna(subset=["Latitude", "Longitude"])
+    df = df[df["PropertyBizKey"] != target["PropertyBizKey"]]
+    df, applied, unsupported = query_service.apply_constraints(df, constraints, target)
+
+    base = {
+        "target": query_service.clean_record(target),
+        "nearby": [],
+        "applied_constraints": applied,
+        "unsupported_constraints": unsupported,
+        "total_matches": 0,
+        "limit": limit,
+    }
+    if df.empty:
+        return base
+
+    distances = haversine_distance_miles(
+        target["Latitude"], target["Longitude"],
+        df["Latitude"].values, df["Longitude"].values,
+    )
+    df = df.copy()
+    df["distance_miles"] = np.round(distances, 2)
+
+    if max_distance_miles:
+        df = df[df["distance_miles"] <= float(max_distance_miles)]
+
+    base["total_matches"] = len(df)
+    nearest = df.sort_values("distance_miles").head(limit)
+    base["nearby"] = [query_service.clean_record(r) for r in nearest.to_dict(orient="records")]
+    return base
