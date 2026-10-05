@@ -25,7 +25,7 @@ VIEW_ALIASES = {
     "budget_vs_actual": "both",
 }
 
-PROPERTY_INFO_FIELDS = ["PropertyBizKey", "PropertyName", "City", "State", "Market", "AssetType"]
+PROPERTY_INFO_FIELDS = ["PropertyBizKey", "PropertyName", "City", "State", "Market", "AssetType", "YearBuilt"]
 
 ACCOUNT_KEY_CANDIDATES = ["GLAccountKey", "AccountKey"]
 ACCOUNT_NAME_CANDIDATES = [
@@ -278,9 +278,12 @@ def _clean_keys(biz_keys) -> list:
 def _property_lookup(keys: list) -> dict:
     df = property_service.get_all_properties()
     subset = df[df["PropertyBizKey"].isin(keys)]
+    units = property_service.get_units_map()
     result = {}
     for record in subset.to_dict(orient="records"):
-        result[record["PropertyBizKey"]] = {f: _clean(record.get(f)) for f in PROPERTY_INFO_FIELDS}
+        info = {f: _clean(record.get(f)) for f in PROPERTY_INFO_FIELDS}
+        info["Units"] = units.get(record["PropertyBizKey"])
+        result[record["PropertyBizKey"]] = info
     return result
 
 
