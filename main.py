@@ -316,6 +316,19 @@ def _unknown_response(task_id: str, parsed: dict, message: str) -> dict:
 
 @app.post("/ask-ai", dependencies=[Depends(verify_secret_key)])
 def ask_ai(req: AskAIRequest):
+    try:
+        return _ask_ai(req)
+    except HTTPException:
+        raise
+    except Exception:
+        # A plain 500 from the server-level handler carries no CORS headers, which
+        # the browser reports as "backend unreachable". Raise HTTPException so the
+        # response still passes through CORSMiddleware and the client can retry.
+        logger.exception("ask-ai failed")
+        raise HTTPException(status_code=500, detail="The request could not be completed. Please try again.")
+
+
+def _ask_ai(req: AskAIRequest):
     button_view = _resolve_view(req.view)
     parsed = ai_service.resolve_intent(req.query, query_service.catalog_prompt())
     intent = parsed["intent"]
