@@ -2,12 +2,10 @@ import logging
 import secrets
 from datetime import datetime, timezone
 from typing import Any, Optional
-
 import requests
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel
-
 import property_service
 import geo_service
 import comparison_service
