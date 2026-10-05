@@ -1,6 +1,8 @@
 import os
 from dotenv import load_dotenv
+
 load_dotenv()
+
 
 def _parse_int_list(value: str) -> list:
     result = []
@@ -53,11 +55,13 @@ class Settings:
 
     DEFAULT_NEARBY_COUNT: int = int(os.getenv("DEFAULT_NEARBY_COUNT", "5"))
     MAX_NEARBY_COUNT: int = int(os.getenv("MAX_NEARBY_COUNT", "20"))
+    RADIUS_RESULT_CAP: int = int(os.getenv("RADIUS_RESULT_CAP", "50"))
 
     ASK_AI_ENDPOINT: str = os.getenv("ASK_AI_ENDPOINT", "")
     ASK_AI_API_KEY: str = os.getenv("ASK_AI_API_KEY", "")
     ASK_AI_MODEL_NAME: str = os.getenv("ASK_AI_MODEL_NAME", "")
     ASK_AI_TIMEOUT_SECONDS: int = int(os.getenv("ASK_AI_TIMEOUT_SECONDS", "30"))
+    ASK_AI_MAX_TOKENS: int = int(os.getenv("ASK_AI_MAX_TOKENS", "700"))
 
     SECRET_KEY: str = os.getenv("SECRET_KEY", "")
 
