@@ -20,14 +20,20 @@ Schema:
   "constraints": [{"field": "string", "op": "string", "value": any}],
   "fields": ["string", ...],
   "unsupported": ["string", ...],
-  "data_view": "actual" | "budget" | "both" | null
+  "data_view": "actual" | "budget" | "both" | null,
+  "metrics": ["string", ...],
+  "metric_constraints": [{"metric": "string", "op": "string", "value": any, "basis": "string"}],
+  "sort": {"metric": "string", "direction": "asc" | "desc"} | null,
+  "period": {"from": integer or null, "to": integer or null} | null,
+  "visualization": "string" | null,
+  "chart_metric": "string" | null
 }
 
 Intent rules:
 - "search": find or get information about one named property.
 - "nearest": find properties near one named property, including requests with a distance limit such as "within 10 miles" or "under 10 miles".
 - "compare": compare named properties with each other, or compare one property with other properties (nearby, similar, or meeting conditions). If the user says "this property" or "the selected property" without a name, leave property_names empty.
-- "list": the user wants properties matching conditions but names no reference property.
+- "list": the user wants properties matching conditions (attributes or metrics) but names no reference property. Ranking requests such as "largest properties by unit count" are "list" with a sort.
 - "unknown": anything else.
 
 Field rules:
@@ -40,6 +46,21 @@ Field rules:
 - unsupported: short descriptions of any condition the user asked for that cannot be expressed with the listed fields, for example a price or bedroom requirement. Never force such a condition into constraints.
 - data_view: "actual" for actual results, "budget" for budget or forecast figures, "both" for actual versus budget, variance or over/under budget, otherwise null.
 
+Metric rules (metrics come from unit data and are listed below the constraint fields):
+- metrics: metric keys the user wants shown, for example "show unit counts" or "unit count and occupancy". Use [] otherwise.
+- metric_constraints: conditions on a metric. op is one of "gte", "lte", "gt", "lt", "eq", "between". basis says what value means:
+  "absolute" for a plain number (more than 200 units -> gt 200),
+  "percent_of_subject" for a share of the reference property's value (at least 80% of its unit count -> gte 80),
+  "percent_above_subject" for larger than the reference by a percentage (20% more units than <Name A> -> gte 20),
+  "percent_below_subject" for smaller than the reference by a percentage,
+  "percentile" for position among the candidate properties (top 10% by units -> gte 90).
+  Relative bases need a reference property. If the user gives a percentage without a clear basis, choose the most natural one and keep it; never invent numbers.
+- sort: ordering by a metric, for example "largest" -> {"metric":"units","direction":"desc"}, "smallest" -> asc. null when no ordering is asked.
+- period: a YYYYMM month range only when the user names months or a year (for example "in 2026-09 to 2026-10" -> from 202609, to 202610; a single month uses the same value for both). null otherwise.
+- visualization: "bar" or "pie" (or another listed output format) ONLY when the user explicitly asks for a chart, graph or plot. Otherwise null. Never choose a chart on your own.
+- chart_metric: the metric key to chart. Default to "units" when a chart is requested without a metric.
+- Never calculate or guess results. Only describe what to retrieve; the system executes the query against the data.
+
 Available constraint fields:
 {catalog}
 
@@ -50,6 +71,11 @@ Question: Compare <Name A> with 5 similar properties in the same market
 {"intent":"compare","property_names":["<Name A>"],"nearby_count":5,"max_distance_miles":null,"constraints":[{"field":"Market","op":"same_as_subject","value":null}],"fields":["YearBuilt"],"unsupported":[],"data_view":null}
 Question: Compare <Name A> and <Name B> budget versus actual
 {"intent":"compare","property_names":["<Name A>","<Name B>"],"nearby_count":null,"max_distance_miles":null,"constraints":[],"fields":[],"unsupported":[],"data_view":"both"}
+
+Question: Compare properties within 20 miles of <Name A> whose unit count is at least 20% above it as a bar chart
+{"intent":"compare","property_names":["<Name A>"],"nearby_count":null,"max_distance_miles":20,"constraints":[],"fields":[],"unsupported":[],"data_view":null,"metrics":["units"],"metric_constraints":[{"metric":"units","op":"gte","value":20,"basis":"percent_above_subject"}],"sort":null,"period":null,"visualization":"bar","chart_metric":"units"}
+Question: Show the 10 largest properties by unit count in <a state value> as a pie chart
+{"intent":"list","property_names":[],"nearby_count":10,"max_distance_miles":null,"constraints":[{"field":"State","op":"eq","value":"<a state value>"}],"fields":[],"unsupported":[],"data_view":null,"metrics":["units"],"metric_constraints":[],"sort":{"metric":"units","direction":"desc"},"period":null,"visualization":"pie","chart_metric":"units"}
 
 Respond with the JSON object only."""
 
@@ -142,6 +168,12 @@ def _empty_result() -> dict:
         "fields": [],
         "unsupported": [],
         "data_view": None,
+        "metrics": [],
+        "metric_constraints": [],
+        "sort": None,
+        "period": None,
+        "visualization": None,
+        "chart_metric": None,
     }
 
 
@@ -212,6 +244,12 @@ def resolve_intent(user_query: str, catalog: str = "") -> dict:
     constraints = parsed.get("constraints")
     fields = parsed.get("fields")
     unsupported = parsed.get("unsupported")
+    metrics = parsed.get("metrics")
+    metric_constraints = parsed.get("metric_constraints")
+    sort = parsed.get("sort")
+    period = parsed.get("period")
+    visualization = parsed.get("visualization")
+    chart_metric = parsed.get("chart_metric")
 
     return {
         "intent": intent,
@@ -222,4 +260,10 @@ def resolve_intent(user_query: str, catalog: str = "") -> dict:
         "fields": fields if isinstance(fields, list) else [],
         "unsupported": unsupported if isinstance(unsupported, list) else [],
         "data_view": data_view,
+        "metrics": metrics if isinstance(metrics, list) else [],
+        "metric_constraints": metric_constraints if isinstance(metric_constraints, list) else [],
+        "sort": sort if isinstance(sort, dict) else None,
+        "period": period if isinstance(period, dict) else None,
+        "visualization": str(visualization).strip().lower() if isinstance(visualization, str) and visualization.strip() else None,
+        "chart_metric": str(chart_metric).strip() if isinstance(chart_metric, str) and chart_metric.strip() else None,
     }
