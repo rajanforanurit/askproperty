@@ -5,6 +5,7 @@ from typing import Any, Optional
 import pandas as pd
 
 import financial_service
+import unit_service
 from property_service import get_by_bizkey
 
 logger = logging.getLogger(__name__)
@@ -27,10 +28,6 @@ DEFAULT_COMPARISON_FIELDS = [
 
 
 def _clean_value(value: Any) -> Any:
-    """Convert pandas/numpy values into JSON-safe Python values.
-
-    NaN / NaT / pd.NA / +-inf become None so FastAPI can serialise the response.
-    """
     if value is None:
         return None
 
@@ -38,7 +35,6 @@ def _clean_value(value: Any) -> Any:
         if pd.isna(value):
             return None
     except (TypeError, ValueError):
-        # pd.isna on list-like values returns an array; treat those as non-null
         pass
 
     if hasattr(value, "item"):
@@ -101,7 +97,12 @@ def build_comparison(
     ym_to: Optional[int] = None,
     top_accounts: Optional[int] = None,
 ) -> dict:
+    include_units = not fields
     fields = fields or DEFAULT_COMPARISON_FIELDS
+    try:
+        units = unit_service.get_units_map(ym_from, ym_to) if include_units else {}
+    except ValueError:
+        units = unit_service.get_units_map() if include_units else {}
     rows = []
     not_found = []
     found_keys = []
@@ -113,10 +114,13 @@ def build_comparison(
             continue
         record = _clean_record(record)
         found_keys.append(str(record["PropertyBizKey"]))
-        rows.append({field: record.get(field) for field in fields})
+        row = {field: record.get(field) for field in fields}
+        if include_units:
+            row["Units"] = units.get(str(record["PropertyBizKey"]))
+        rows.append(row)
 
     result = {
-        "fields": fields,
+        "fields": fields + (["Units"] if include_units else []),
         "properties": rows,
         "not_found": not_found,
     }
