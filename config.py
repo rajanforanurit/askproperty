@@ -24,6 +24,18 @@ class Settings:
     PRODUCT_TABLE: str = os.getenv("REBA_PRODUCT_TABLE", "Reba_Product")
     UNITS_COLUMN: str = os.getenv("UNITS_COLUMN", "NumberOfUnits")
 
+    FACTUNIT_TABLE: str = os.getenv("REBA_FACTUNIT_TABLE", "Reba_FactUnit")
+    FACTUNIT_PROPERTY_COLUMN: str = os.getenv("FACTUNIT_PROPERTY_COLUMN", "Property BizKey")
+    FACTUNIT_UNIT_COLUMN: str = os.getenv("FACTUNIT_UNIT_COLUMN", "Unit BizKey")
+    FACTUNIT_MONTH_COLUMN: str = os.getenv("FACTUNIT_MONTH_COLUMN", "YearMonthKey")
+    FACTUNIT_DAYS_COLUMN: str = os.getenv("FACTUNIT_DAYS_COLUMN", "DaysCount")
+    FACTUNIT_OCCUPIED_COLUMN: str = os.getenv("FACTUNIT_OCCUPIED_COLUMN", "OccupiedUnitCount")
+    FACTUNIT_AREA_COLUMN: str = os.getenv("FACTUNIT_AREA_COLUMN", "UnitSquare")
+    UNIT_DUPLICATE_MODE: str = os.getenv("UNIT_DUPLICATE_MODE", "max").strip().lower()
+    UNIT_DEFAULT_PERIOD_MONTHS: int = int(os.getenv("UNIT_DEFAULT_PERIOD_MONTHS", "1"))
+    CHART_MAX_BARS: int = int(os.getenv("CHART_MAX_BARS", "50"))
+    CHART_MAX_SLICES: int = int(os.getenv("CHART_MAX_SLICES", "12"))
+
     FACTGL_TABLE: str = os.getenv("REBA_FACTGL_TABLE", "Reba_FactGL")
     BUDGET_TABLE: str = os.getenv("REBA_BUDGET_TABLE", "Reba_Budget")
     GL_ACCOUNT_TABLE: str = os.getenv("REBA_GL_ACCOUNT_TABLE", "Reba_GeneralLedgerAccount")
@@ -59,7 +71,7 @@ class Settings:
     ASK_AI_API_KEY: str = os.getenv("ASK_AI_API_KEY", "")
     ASK_AI_MODEL_NAME: str = os.getenv("ASK_AI_MODEL_NAME", "")
     ASK_AI_TIMEOUT_SECONDS: int = int(os.getenv("ASK_AI_TIMEOUT_SECONDS", "30"))
-    ASK_AI_MAX_TOKENS: int = int(os.getenv("ASK_AI_MAX_TOKENS", "700"))
+    ASK_AI_MAX_TOKENS: int = int(os.getenv("ASK_AI_MAX_TOKENS", "1500"))
 
     SECRET_KEY: str = os.getenv("SECRET_KEY", "")
 
