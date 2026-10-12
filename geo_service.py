@@ -4,6 +4,7 @@ import pandas as pd
 
 from property_service import get_all_properties, get_by_bizkey
 from config import settings
+import metric_service
 import query_service
 
 logger = logging.getLogger(__name__)
@@ -72,6 +73,11 @@ def find_relevant_properties(
     max_distance_miles: float = None,
     constraints: list = None,
     active_only: bool = None,
+    metric_constraints: list = None,
+    sort: dict = None,
+    display_metrics: list = None,
+    ym_from: int = None,
+    ym_to: int = None,
 ) -> dict:
     target = get_by_bizkey(target_biz_key)
     if target is None:
@@ -99,6 +105,7 @@ def find_relevant_properties(
         "nearby": [],
         "applied_constraints": applied,
         "unsupported_constraints": unsupported,
+        "metric_constraints_applied": [],
         "total_matches": 0,
         "limit": limit,
     }
@@ -115,7 +122,19 @@ def find_relevant_properties(
     if max_distance_miles:
         df = df[df["distance_miles"] <= float(max_distance_miles)]
 
+    df, metric_applied, metric_unsupported = metric_service.apply_metric_constraints(
+        df, metric_constraints or [], ym_from, ym_to, target,
+    )
+    base["metric_constraints_applied"] = metric_applied
+    base["unsupported_constraints"] = unsupported + metric_unsupported
+
+    df, _, _ = metric_service.ensure_metrics(df, display_metrics or [], ym_from, ym_to)
+
     base["total_matches"] = len(df)
-    nearest = df.sort_values("distance_miles").head(limit)
+    if sort:
+        ordered = metric_service.apply_sort(df, sort, ym_from, ym_to)
+    else:
+        ordered = df.sort_values("distance_miles")
+    nearest = ordered.head(limit)
     base["nearby"] = [query_service.clean_record(r) for r in nearest.to_dict(orient="records")]
     return base
