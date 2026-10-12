@@ -6,7 +6,9 @@ from typing import Optional
 
 import pandas as pd
 
+import metric_service
 import property_service
+import visualization_service
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -138,6 +140,10 @@ def catalog_prompt() -> str:
                 lines.append(f"- {item['field']} (category, {item['distinct']} distinct values, use the user's wording)")
         else:
             lines.append(f"- {item['field']} (number): {item['min']} to {item['max']}")
+    lines.append("")
+    lines.append(metric_service.catalog_prompt())
+    lines.append("")
+    lines.append(visualization_service.catalog_prompt())
     return "\n".join(lines)
 
 
@@ -297,16 +303,37 @@ def apply_constraints(df: pd.DataFrame, constraints: list, subject: Optional[dic
     return df, applied, unsupported
 
 
-def filter_properties(constraints: list, active_only: Optional[bool] = None, limit: Optional[int] = None):
+def filter_properties(
+    constraints: list,
+    active_only: Optional[bool] = None,
+    limit: Optional[int] = None,
+    metric_constraints: Optional[list] = None,
+    sort: Optional[dict] = None,
+    display_metrics: Optional[list] = None,
+    ym_from: Optional[int] = None,
+    ym_to: Optional[int] = None,
+):
     if active_only is None:
         active_only = not any(c["field"] == "PropertyStatus" for c in constraints)
     cap = settings.RADIUS_RESULT_CAP
     limit = min(limit or cap, cap)
     df = property_service.get_all_properties(active_only=active_only)
     df, applied, unsupported = apply_constraints(df, constraints, None)
+    df, metric_applied, metric_unsupported = metric_service.apply_metric_constraints(
+        df, metric_constraints or [], ym_from, ym_to, None,
+    )
+    df, _, _ = metric_service.ensure_metrics(df, display_metrics or [], ym_from, ym_to)
     total = len(df)
-    rows = [clean_record(r) for r in df.sort_values("PropertyName").head(limit).to_dict(orient="records")]
-    return {"results": rows, "applied_constraints": applied, "unsupported_constraints": unsupported, "total_matches": total, "limit": limit}
+    df = metric_service.apply_sort(df, sort, ym_from, ym_to, fallback="PropertyName")
+    rows = [clean_record(r) for r in df.head(limit).to_dict(orient="records")]
+    return {
+        "results": rows,
+        "applied_constraints": applied,
+        "unsupported_constraints": unsupported + metric_unsupported,
+        "metric_constraints_applied": metric_applied,
+        "total_matches": total,
+        "limit": limit,
+    }
 
 
 ALWAYS_FIELDS = ["PropertyBizKey", "PropertyName"]
@@ -315,11 +342,6 @@ MAX_FIELDS = 12
 
 
 def sanitize_fields(raw):
-    """Validate the attribute names the model says the user wants shown/compared.
-
-    Returns (fields, unsupported). `fields` is [] when the user named no valid
-    attributes, so callers fall back to the default comparison fields.
-    """
     if not isinstance(raw, list) or not raw:
         return [], []
 
@@ -378,7 +400,7 @@ def build_markers(subject: Optional[dict], others: list, role: str) -> list:
     return markers
 
 
-def build_table(subject: Optional[dict], others: list, fields: Optional[list] = None) -> dict:
+def build_table(subject: Optional[dict], others: list, fields: Optional[list] = None, metric_keys: Optional[list] = None) -> dict:
     records = ([subject] if subject else []) + list(others)
     has_distance = any(clean_record(r).get("distance_miles") is not None for r in records)
     wanted = None
@@ -389,6 +411,7 @@ def build_table(subject: Optional[dict], others: list, fields: Optional[list] = 
         for key, label, kind in TABLE_COLUMNS
         if (key != "distance_miles" or has_distance) and (wanted is None or key in wanted or key == "distance_miles")
     ]
+    columns = columns + metric_service.table_columns(metric_keys or [])
     rows = []
     for index, record in enumerate(records):
         clean = clean_record(record)
@@ -413,6 +436,8 @@ def build_task(
     unsupported: list,
     notes: list,
     fields: Optional[list] = None,
+    metric_keys: Optional[list] = None,
+    extra: Optional[dict] = None,
 ) -> dict:
     markers = build_markers(subject, others, role)
     total = len(others) + (1 if subject else 0)
@@ -430,7 +455,8 @@ def build_task(
             "plotted": len(markers),
             "unplotted": total - len(markers),
             "notes": notes,
+            **(extra or {}),
         },
         "markers": markers,
-        "table": build_table(subject, others, fields),
+        "table": build_table(subject, others, fields, metric_keys),
     }
