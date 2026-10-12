@@ -12,13 +12,16 @@ import comparison_service
 import financial_service
 import query_service
 import ai_service
+import unit_service
+import metric_service
+import visualization_service
 from db import check_connection
 from config import settings, validate_secret_key_settings, validate_savechat_settings
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Ask Property Data Intelligence API", version="1.23.0")
+app = FastAPI(title="Ask Property Data Intelligence API", version="1.24.0")
 
 
 class CompareRequest(BaseModel):
@@ -37,6 +40,7 @@ class AskAIRequest(BaseModel):
     year_month_from: Optional[int] = None
     year_month_to: Optional[int] = None
     top_accounts: Optional[int] = None
+    chart: Optional[str] = None
 
 
 class SaveChatRequest(BaseModel):
@@ -121,6 +125,11 @@ def financial_diagnostics():
     return financial_service.diagnostics()
 
 
+@app.get("/admin/unit-diagnostics", dependencies=[Depends(verify_secret_key)])
+def unit_diagnostics():
+    return unit_service.diagnostics()
+
+
 @app.get("/properties/search", dependencies=[Depends(verify_secret_key)])
 def search_properties(
     q: str = Query(..., min_length=1),
@@ -144,6 +153,30 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+
+@app.get("/properties/{biz_key}/unit-count", dependencies=[Depends(verify_secret_key)])
+def property_unit_count(
+    biz_key: str,
+    year_month_from: Optional[int] = Query(None),
+    year_month_to: Optional[int] = Query(None),
+):
+    record = property_service.get_by_bizkey(biz_key)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Property '{biz_key}' not found.")
+    try:
+        frame, meta = unit_service.get_period_metrics(year_month_from, year_month_to, keys=[biz_key])
+        monthly = unit_service.get_monthly_unit_counts(biz_key, year_month_from, year_month_to)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    metrics = query_service.clean_record(frame.iloc[0].to_dict()) if not frame.empty else None
+    return {
+        "PropertyBizKey": str(record["PropertyBizKey"]),
+        "PropertyName": record["PropertyName"],
+        "period": meta,
+        "metrics": metrics,
+        "monthly": monthly,
+    }
 
 
 @app.get("/properties/{biz_key}/financials", dependencies=[Depends(verify_secret_key)])
@@ -252,18 +285,27 @@ def _dedupe(items: list) -> list:
     return seen
 
 
-def _find_nearby(target_key: str, count: Optional[int], radius: Optional[float], constraints: list) -> dict:
+def _find_nearby(target_key: str, count: Optional[int], radius: Optional[float], constraints: list, plan: dict) -> dict:
     try:
-        if radius is None and not constraints:
+        if radius is None and not constraints and not plan["metric_constraints"] and not plan["sort"]:
             result = geo_service.find_nearest_properties(target_key, count=count)
             return {
                 "target": query_service.clean_record(result["target"]),
                 "nearby": [query_service.clean_record(r) for r in result["nearby"]],
                 "applied": [],
+                "metric_applied": [],
                 "unsupported": [],
             }
         result = geo_service.find_relevant_properties(
-            target_key, count=count, max_distance_miles=radius, constraints=constraints,
+            target_key,
+            count=count,
+            max_distance_miles=radius,
+            constraints=constraints,
+            metric_constraints=plan["metric_constraints"],
+            sort=plan["sort"],
+            display_metrics=plan["display_metrics"],
+            ym_from=plan["ym_from"],
+            ym_to=plan["ym_to"],
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -271,6 +313,7 @@ def _find_nearby(target_key: str, count: Optional[int], radius: Optional[float],
         "target": result["target"],
         "nearby": result["nearby"],
         "applied": result["applied_constraints"],
+        "metric_applied": result["metric_constraints_applied"],
         "unsupported": result["unsupported_constraints"],
     }
 
@@ -314,6 +357,143 @@ def _unknown_response(task_id: str, parsed: dict, message: str) -> dict:
     }
 
 
+def _plan_period(req: "AskAIRequest", parsed: dict) -> tuple:
+    if req.year_month_from is not None or req.year_month_to is not None:
+        try:
+            period = unit_service.normalize_period(req.year_month_from, req.year_month_to)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return period
+    model_period = parsed.get("period")
+    if model_period:
+        try:
+            period = unit_service.normalize_period(model_period.get("from"), model_period.get("to"))
+        except (ValueError, AttributeError):
+            period = None
+        if period:
+            return period
+    return None, None
+
+
+def _build_plan(req: "AskAIRequest") -> dict:
+    button_view = _resolve_view(req.view)
+    parsed = ai_service.resolve_intent(req.query, query_service.catalog_prompt())
+    intent = parsed["intent"]
+    view = button_view or parsed.get("data_view")
+    if intent == "compare" and not view:
+        view = "actual"
+
+    constraints, flagged = query_service.sanitize_constraints(parsed.get("constraints"), parsed.get("unsupported"))
+    fields, unsupported_fields = query_service.sanitize_fields(parsed.get("fields"))
+    metric_keys, flagged_metrics = metric_service.sanitize_metrics(parsed.get("metrics"))
+    metric_constraints, flagged_metric_constraints = metric_service.sanitize_metric_constraints(parsed.get("metric_constraints"))
+    sort, flagged_sort = metric_service.sanitize_sort(parsed.get("sort"))
+    flagged = _dedupe(flagged + unsupported_fields + flagged_metrics + flagged_metric_constraints + flagged_sort)
+
+    chart = visualization_service.resolve(req.query, parsed.get("visualization"), req.chart)
+    chart_metric = None
+    if chart:
+        chart_metric = metric_service.resolve_metric(parsed.get("chart_metric"))
+        if chart_metric is None:
+            if sort:
+                chart_metric = sort["metric"]
+            elif metric_keys:
+                chart_metric = metric_keys[0]
+            elif metric_constraints:
+                chart_metric = metric_constraints[0]["metric"]
+            else:
+                chart_metric = "units"
+
+    display_metrics = metric_service.display_metrics(metric_keys, metric_constraints, sort, chart_metric)
+    ym_from, ym_to = _plan_period(req, parsed)
+
+    return {
+        "parsed": parsed,
+        "intent": intent,
+        "names": parsed["property_names"],
+        "view": view,
+        "task_id": query_service.new_task_id(),
+        "radius": parsed.get("max_distance_miles"),
+        "count": parsed.get("nearby_count"),
+        "constraints": constraints,
+        "metric_constraints": metric_constraints,
+        "sort": sort,
+        "fields": fields,
+        "flagged": flagged,
+        "chart": chart,
+        "chart_metric": chart_metric,
+        "display_metrics": display_metrics,
+        "ym_from": ym_from,
+        "ym_to": ym_to,
+        "context_key": (req.context_property_key or "").strip(),
+    }
+
+
+def _period_notes(plan: dict) -> tuple:
+    if not plan["display_metrics"]:
+        return None, []
+    try:
+        period = unit_service.describe_period(plan["ym_from"], plan["ym_to"])
+    except ValueError:
+        period = None
+    if period is None:
+        return None, ["Unit data is not available, so unit-based metrics could not be calculated."]
+    if period["source"] == "product_table":
+        return period, ["Unit counts come from the property table because monthly unit data is unavailable."]
+    note = (
+        f"Unit metrics are averages over {period['year_month_from']} to {period['year_month_to']} "
+        f"({period['calendar_days']} calendar days): total unit-days divided by calendar days."
+    )
+    return period, [note]
+
+
+def _task(plan: dict, kind: str, subject: Optional[dict], others: list, role: str, radius: Optional[float],
+          count: Optional[int], applied: list, unsupported: list, notes: list,
+          metric_applied: Optional[list] = None) -> dict:
+    period, period_notes = _period_notes(plan)
+    keys = plan["display_metrics"]
+    subject_record = metric_service.attach_metrics([subject], keys, plan["ym_from"], plan["ym_to"])[0] if subject else None
+    other_records = metric_service.attach_metrics(list(others), keys, plan["ym_from"], plan["ym_to"])
+    extra = {
+        "period": period,
+        "metrics": keys,
+        "metric_constraints_applied": metric_applied or [],
+        "sort": plan["sort"],
+        "interpretation": {
+            "intent": plan["intent"],
+            "property_names": plan["names"],
+            "constraints": plan["constraints"],
+            "metric_constraints": plan["metric_constraints"],
+            "sort": plan["sort"],
+            "visualization": plan["chart"],
+            "chart_metric": plan["chart_metric"],
+        },
+    }
+    return query_service.build_task(
+        plan["task_id"], kind, subject_record, other_records, role, plan["view"], radius, count,
+        applied, unsupported, notes + period_notes, plan["fields"], keys, extra,
+    )
+
+
+def _present(response: dict, plan: dict) -> dict:
+    response["output_format"] = "table"
+    response["visualization"] = None
+    chart = plan["chart"]
+    if not chart:
+        return response
+    table = response.get("table") or {}
+    if not table.get("rows"):
+        return response
+    column = metric_service.metric_definition(plan["chart_metric"])["column"]
+    spec, note = visualization_service.build(chart, table, column)
+    if spec is not None:
+        response["output_format"] = chart
+        response["visualization"] = spec
+    elif note:
+        response.setdefault("task", {}).setdefault("notes", []).append(note)
+    return response
+
+
 @app.post("/ask-ai", dependencies=[Depends(verify_secret_key)])
 def ask_ai(req: AskAIRequest):
     try:
@@ -321,28 +501,29 @@ def ask_ai(req: AskAIRequest):
     except HTTPException:
         raise
     except Exception:
-        # A plain 500 from the server-level handler carries no CORS headers, which
-        # the browser reports as "backend unreachable". Raise HTTPException so the
-        # response still passes through CORSMiddleware and the client can retry.
         logger.exception("ask-ai failed")
         raise HTTPException(status_code=500, detail="The request could not be completed. Please try again.")
 
 
 def _ask_ai(req: AskAIRequest):
-    button_view = _resolve_view(req.view)
-    parsed = ai_service.resolve_intent(req.query, query_service.catalog_prompt())
-    intent = parsed["intent"]
-    names = parsed["property_names"]
-    view = button_view or parsed.get("data_view")
-    if intent == "compare" and not view:
-        view = "actual"
-    task_id = query_service.new_task_id()
-    radius = parsed.get("max_distance_miles")
-    count = parsed.get("nearby_count")
-    constraints, flagged = query_service.sanitize_constraints(parsed.get("constraints"), parsed.get("unsupported"))
-    fields, unsupported_fields = query_service.sanitize_fields(parsed.get("fields"))
-    flagged = _dedupe(flagged + unsupported_fields)
-    context_key = (req.context_property_key or "").strip()
+    plan = _build_plan(req)
+    response = _execute(req, plan)
+    return _present(response, plan)
+
+
+def _execute(req: AskAIRequest, plan: dict):
+    parsed = plan["parsed"]
+    intent = plan["intent"]
+    names = plan["names"]
+    view = plan["view"]
+    task_id = plan["task_id"]
+    radius = plan["radius"]
+    count = plan["count"]
+    constraints = plan["constraints"]
+    metric_constraints = plan["metric_constraints"]
+    flagged = plan["flagged"]
+    fields = plan["fields"]
+    context_key = plan["context_key"]
 
     generic_message = "Could not understand the request. Try rephrasing or specify a property name."
 
@@ -350,19 +531,28 @@ def _ask_ai(req: AskAIRequest):
         return _unknown_response(task_id, parsed, generic_message)
 
     if intent == "list" and not names:
-        if not constraints:
+        if not constraints and not metric_constraints and not plan["sort"]:
             return _unknown_response(task_id, parsed, generic_message)
-        listing = query_service.filter_properties(constraints, limit=count)
+        listing = query_service.filter_properties(
+            constraints,
+            limit=count,
+            metric_constraints=metric_constraints,
+            sort=plan["sort"],
+            display_metrics=plan["display_metrics"],
+            ym_from=plan["ym_from"],
+            ym_to=plan["ym_to"],
+        )
         rows = listing["results"]
         unsupported = _dedupe(flagged + listing["unsupported_constraints"])
         keys = [str(r["PropertyBizKey"]) for r in rows]
         financials, fin_notes = _financial_bundle(keys, view, req)
-        notes = _task_notes(count, len(rows), None, listing["applied_constraints"], unsupported) + fin_notes
+        applied_all = listing["applied_constraints"] + listing["metric_constraints_applied"]
+        notes = _task_notes(count, len(rows), None, applied_all, unsupported) + fin_notes
         if listing["total_matches"] > len(rows):
             notes.append(f"Showing {len(rows)} of {listing['total_matches']} matching properties.")
-        task = query_service.build_task(
-            task_id, "list", None, rows, "result", view, None, count,
-            listing["applied_constraints"], unsupported, notes, fields,
+        task = _task(
+            plan, "list", None, rows, "result", None, count,
+            listing["applied_constraints"], unsupported, notes, listing["metric_constraints_applied"],
         )
         return {"intent": "search", "results": rows, "unresolved": [], **task, **financials}
 
@@ -401,20 +591,18 @@ def _ask_ai(req: AskAIRequest):
         others = [] if subject else resolved
         keys = [str(p["PropertyBizKey"]) for p in resolved]
         financials, fin_notes = _financial_bundle(keys, view, req)
-        task = query_service.build_task(
-            task_id, "search", subject, others, "result", view, None, None, [], flagged, fin_notes, fields,
-        )
+        task = _task(plan, "search", subject, others, "result", None, None, [], flagged, fin_notes)
         return {"intent": "search", "results": resolved, "unresolved": unresolved, **task, **financials}
 
     if effective == "nearest":
-        found = _find_nearby(resolved[0]["PropertyBizKey"], count, radius, constraints)
+        found = _find_nearby(resolved[0]["PropertyBizKey"], count, radius, constraints, plan)
         unsupported = _dedupe(flagged + found["unsupported"])
         keys = [str(found["target"]["PropertyBizKey"])] + [str(p["PropertyBizKey"]) for p in found["nearby"]]
         financials, fin_notes = _financial_bundle(keys, view, req)
-        notes = _task_notes(count, len(found["nearby"]), radius, found["applied"], unsupported) + fin_notes
-        task = query_service.build_task(
-            task_id, "nearest", found["target"], found["nearby"], "nearby", view, radius, count,
-            found["applied"], unsupported, notes, fields,
+        notes = _task_notes(count, len(found["nearby"]), radius, found["applied"] + found["metric_applied"], unsupported) + fin_notes
+        task = _task(
+            plan, "nearest", found["target"], found["nearby"], "nearby", radius, count,
+            found["applied"], unsupported, notes, found["metric_applied"],
         )
         return {
             "intent": "nearest",
@@ -428,24 +616,28 @@ def _ask_ai(req: AskAIRequest):
     if effective == "compare":
         if len(resolved) >= 2:
             biz_keys = [str(p["PropertyBizKey"]) for p in resolved]
-            comparison = comparison_service.build_comparison(biz_keys, fields=fields)
+            comparison = comparison_service.build_comparison(
+                biz_keys, fields=fields, ym_from=plan["ym_from"], ym_to=plan["ym_to"],
+            )
             financials, fin_notes = _financial_bundle(biz_keys, view, req)
-            task = query_service.build_task(
-                task_id, "compare", query_service.clean_record(resolved[0]),
+            task = _task(
+                plan, "compare", query_service.clean_record(resolved[0]),
                 [query_service.clean_record(p) for p in resolved[1:]], "comparison",
-                view, None, None, [], flagged, fin_notes, fields,
+                None, None, [], flagged, fin_notes,
             )
             return {"intent": "compare", "comparison": comparison, "unresolved": unresolved, **task, **financials}
 
-        found = _find_nearby(resolved[0]["PropertyBizKey"], count, radius, constraints)
+        found = _find_nearby(resolved[0]["PropertyBizKey"], count, radius, constraints, plan)
         unsupported = _dedupe(flagged + found["unsupported"])
         all_keys = [str(found["target"]["PropertyBizKey"])] + [str(p["PropertyBizKey"]) for p in found["nearby"]]
-        comparison = comparison_service.build_comparison(all_keys, fields=fields)
+        comparison = comparison_service.build_comparison(
+            all_keys, fields=fields, ym_from=plan["ym_from"], ym_to=plan["ym_to"],
+        )
         financials, fin_notes = _financial_bundle(all_keys, view, req)
-        notes = _task_notes(count, len(found["nearby"]), radius, found["applied"], unsupported) + fin_notes
-        task = query_service.build_task(
-            task_id, "compare", found["target"], found["nearby"], "comparison", view, radius, count,
-            found["applied"], unsupported, notes, fields,
+        notes = _task_notes(count, len(found["nearby"]), radius, found["applied"] + found["metric_applied"], unsupported) + fin_notes
+        task = _task(
+            plan, "compare", found["target"], found["nearby"], "comparison", radius, count,
+            found["applied"], unsupported, notes, found["metric_applied"],
         )
         return {
             "intent": "compare",
