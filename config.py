@@ -66,6 +66,20 @@ class Settings:
     DEFAULT_NEARBY_COUNT: int = int(os.getenv("DEFAULT_NEARBY_COUNT", "5"))
     MAX_NEARBY_COUNT: int = int(os.getenv("MAX_NEARBY_COUNT", "20"))
     RADIUS_RESULT_CAP: int = int(os.getenv("RADIUS_RESULT_CAP", "50"))
+    DEFAULT_SELECTED_COUNT: int = int(os.getenv("DEFAULT_SELECTED_COUNT", "6"))
+    DEFAULT_REFERENCE_RADIUS_MILES: float = float(os.getenv("DEFAULT_REFERENCE_RADIUS_MILES", "10"))
+
+    GEOCODE_PROVIDER: str = os.getenv("GEOCODE_PROVIDER", "").strip().lower()
+    GEOCODE_URL: str = os.getenv("GEOCODE_URL", "")
+    GEOCODE_API_KEY: str = os.getenv("GEOCODE_API_KEY", "")
+    GEOCODE_TIMEOUT_SECONDS: int = int(os.getenv("GEOCODE_TIMEOUT_SECONDS", "8"))
+    LOCATION_FALLBACK_RADII_MILES: list = [
+        float(v) for v in os.getenv("LOCATION_FALLBACK_RADII_MILES", "25,50,100").split(",") if v.strip()
+    ]
+    LOCATION_PROXIMITY_RADII_MILES: list = [
+        float(v) for v in os.getenv("LOCATION_PROXIMITY_RADII_MILES", "5,10,25,50,100").split(",") if v.strip()
+    ]
+    LOCATION_MAX_GEOCODE_MISSING: int = int(os.getenv("LOCATION_MAX_GEOCODE_MISSING", "10"))
 
     ASK_AI_ENDPOINT: str = os.getenv("ASK_AI_ENDPOINT", "")
     ASK_AI_API_KEY: str = os.getenv("ASK_AI_API_KEY", "")

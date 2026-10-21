@@ -29,6 +29,7 @@ def find_nearest_properties(
     count: int = None,
     active_only: bool = True,
     exclude_missing_coords: bool = True,
+    return_all: bool = False,
 ) -> dict:
     count = count or settings.DEFAULT_NEARBY_COUNT
     count = min(count, settings.MAX_NEARBY_COUNT)
@@ -59,7 +60,8 @@ def find_nearest_properties(
     df = df.copy()
     df["distance_miles"] = np.round(distances, 2)
 
-    nearest = df.sort_values("distance_miles").head(count)
+    ordered = df.sort_values("distance_miles")
+    nearest = ordered if return_all else ordered.head(count)
 
     return {
         "target": target,
@@ -78,6 +80,7 @@ def find_relevant_properties(
     display_metrics: list = None,
     ym_from: int = None,
     ym_to: int = None,
+    return_all: bool = False,
 ) -> dict:
     target = get_by_bizkey(target_biz_key)
     if target is None:
@@ -135,6 +138,73 @@ def find_relevant_properties(
         ordered = metric_service.apply_sort(df, sort, ym_from, ym_to)
     else:
         ordered = df.sort_values("distance_miles")
-    nearest = ordered.head(limit)
+    nearest = ordered if return_all else ordered.head(limit)
     base["nearby"] = [query_service.clean_record(r) for r in nearest.to_dict(orient="records")]
+    return base
+
+
+def find_near_references(
+    reference_keys: list,
+    max_distance_miles: float,
+    constraints: list = None,
+    metric_constraints: list = None,
+    sort: dict = None,
+    display_metrics: list = None,
+    ym_from: int = None,
+    ym_to: int = None,
+) -> dict:
+    """Every property within the radius of ANY reference property (no count limit)."""
+    refs, skipped = [], []
+    for key in reference_keys:
+        record = get_by_bizkey(key)
+        if record is None:
+            continue
+        if pd.isna(record.get("Latitude")) or pd.isna(record.get("Longitude")):
+            skipped.append(str(record.get("PropertyName")))
+        else:
+            refs.append(record)
+    if not refs:
+        raise ValueError("None of the reference properties has coordinates on file.")
+
+    constraints = constraints or []
+    active_only = not any(c["field"] == "PropertyStatus" for c in constraints)
+    df = get_all_properties(active_only=active_only)
+    skipped_candidates = int(df[["Latitude", "Longitude"]].isna().any(axis=1).sum())
+    df = df.dropna(subset=["Latitude", "Longitude"])
+    ref_keys = {str(r["PropertyBizKey"]) for r in refs}
+    df = df[~df["PropertyBizKey"].isin(ref_keys)]
+    df, applied, unsupported = query_service.apply_constraints(df, constraints, refs[0])
+
+    base = {
+        "references": [query_service.clean_record(r) for r in refs],
+        "nearby": [],
+        "applied_constraints": applied,
+        "unsupported_constraints": unsupported,
+        "metric_constraints_applied": [],
+        "skipped_references": skipped,
+        "skipped_candidates": skipped_candidates,
+    }
+    if df.empty:
+        return base
+
+    best = np.full(len(df), np.inf)
+    nearest_ref = np.array([""] * len(df), dtype=object)
+    for ref in refs:
+        d = haversine_distance_miles(ref["Latitude"], ref["Longitude"], df["Latitude"].values, df["Longitude"].values)
+        closer = d < best
+        best = np.where(closer, d, best)
+        nearest_ref = np.where(closer, str(ref["PropertyName"]), nearest_ref)
+    df = df.copy()
+    df["distance_miles"] = np.round(best, 2)
+    df["nearest_reference"] = nearest_ref
+    df = df[df["distance_miles"] <= float(max_distance_miles)]
+
+    df, metric_applied, metric_unsupported = metric_service.apply_metric_constraints(
+        df, metric_constraints or [], ym_from, ym_to, refs[0],
+    )
+    base["metric_constraints_applied"] = metric_applied
+    base["unsupported_constraints"] = unsupported + metric_unsupported
+    df, _, _ = metric_service.ensure_metrics(df, display_metrics or [], ym_from, ym_to)
+    ordered = metric_service.apply_sort(df, sort, ym_from, ym_to) if sort else df.sort_values("distance_miles")
+    base["nearby"] = [query_service.clean_record(r) for r in ordered.to_dict(orient="records")]
     return base

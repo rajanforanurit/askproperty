@@ -64,6 +64,20 @@ def get_by_bizkey(biz_key: str) -> Optional[dict]:
     return match.iloc[0].to_dict()
 
 
+def get_many(keys: list) -> list:
+    """Records for the given keys in the given order (one frame copy, unknown keys skipped)."""
+    wanted = [str(k).strip() for k in keys]
+    df = get_all_properties()
+    rows = df[df["PropertyBizKey"].isin(wanted)].drop_duplicates("PropertyBizKey")
+    by_key = {str(r["PropertyBizKey"]): r for r in rows.to_dict(orient="records")}
+    return [by_key[k] for k in wanted if k in by_key]
+
+
+def name_lookup() -> dict:
+    df = get_all_properties()
+    return dict(zip(df["PropertyBizKey"].astype(str), df["PropertyName"].astype(str)))
+
+
 def search_by_name(query: str, limit: int = 5, active_only: bool = False) -> list[dict]:
     df = get_all_properties(active_only=active_only)
     query_norm = query.strip().lower()

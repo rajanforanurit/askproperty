@@ -312,12 +312,16 @@ def filter_properties(
     display_metrics: Optional[list] = None,
     ym_from: Optional[int] = None,
     ym_to: Optional[int] = None,
+    return_all: bool = False,
+    restrict_keys: Optional[list] = None,
 ):
     if active_only is None:
         active_only = not any(c["field"] == "PropertyStatus" for c in constraints)
     cap = settings.RADIUS_RESULT_CAP
     limit = min(limit or cap, cap)
     df = property_service.get_all_properties(active_only=active_only)
+    if restrict_keys:
+        df = df[df["PropertyBizKey"].isin([str(k) for k in restrict_keys])]
     df, applied, unsupported = apply_constraints(df, constraints, None)
     df, metric_applied, metric_unsupported = metric_service.apply_metric_constraints(
         df, metric_constraints or [], ym_from, ym_to, None,
@@ -325,6 +329,8 @@ def filter_properties(
     df, _, _ = metric_service.ensure_metrics(df, display_metrics or [], ym_from, ym_to)
     total = len(df)
     df = metric_service.apply_sort(df, sort, ym_from, ym_to, fallback="PropertyName")
+    if return_all:
+        limit = total
     rows = [clean_record(r) for r in df.head(limit).to_dict(orient="records")]
     return {
         "results": rows,

@@ -26,7 +26,12 @@ Schema:
   "sort": {"metric": "string", "direction": "asc" | "desc"} | null,
   "period": {"from": integer or null, "to": integer or null} | null,
   "visualization": "string" | null,
-  "chart_metric": "string" | null
+  "chart_metric": "string" | null,
+  "location": {"text": "string", "type": "city" | "state" | "zip" | "address" | "county" | "neighborhood" | "region"} | null,
+  "context_ref": "none" | "results" | "reference",
+  "new_topic": true | false | null,
+  "include_nearby": true | false,
+  "response_focus": "locate" | "compare" | "financial" | "analysis" | null
 }
 
 Intent rules:
@@ -35,6 +40,16 @@ Intent rules:
 - "compare": compare named properties with each other, or compare one property with other properties (nearby, similar, or meeting conditions). If the user says "this property" or "the selected property" without a name, leave property_names empty.
 - "list": the user wants properties matching conditions (attributes or metrics) but names no reference property. Ranking requests such as "largest properties by unit count" are "list" with a sort.
 - "unknown": anything else.
+
+Location and conversation rules:
+- location: a geographic place the user names instead of a property: a city, state, ZIP code, street address, county or neighborhood (for example "properties in Austin, TX", "near 123 Main St Dallas", "within 15 miles of 75201"). Copy the text exactly as typed. null when the user names no place. Never put a place into property_names.
+- context_ref: "results" when the question refers to the properties already shown ("these properties", "compare them", "what about their financials"); "reference" when it refers to the original/anchor property or properties ("show nearby properties", "the original property"); otherwise "none". Use it ONLY when the conversation context below contains such properties.
+- new_topic: true when the question is independent of the conversation context, false when it builds on it, null when there is no context.
+- include_nearby: true when the user wants nearby properties included alongside the named or referenced ones (for example "compare these with nearby properties within 10 miles").
+- response_focus: "locate" for finding/listing/showing properties (including nearby searches), "compare" for comparing properties, "financial" for questions mainly about financial figures, "analysis" for broad analysis across a portfolio, several states or markets. null if unclear.
+- When the user names several states, cities or markets (\"across Texas and Florida\"), use a constraint such as State in [\"TX\",\"FL\"] instead of location, and set response_focus to \"analysis\".
+- When the user only changes the distance ("what about 15 miles?"), set context_ref to "reference".
+- Resolve references using the conversation context. Do NOT copy property names from the context into property_names; use context_ref instead.
 
 Field rules:
 - property_names: names exactly as the user typed them. Never invent or guess a name.
@@ -64,6 +79,9 @@ Metric rules (metrics come from unit data and are listed below the constraint fi
 Available constraint fields:
 {catalog}
 
+Conversation context (may be empty):
+{context}
+
 Examples of the format (the names and values here are placeholders):
 Question: Find properties within 10 miles of <Name A>
 {"intent":"nearest","property_names":["<Name A>"],"nearby_count":null,"max_distance_miles":10,"constraints":[],"fields":[],"unsupported":[],"data_view":null}
@@ -77,15 +95,29 @@ Question: Compare properties within 20 miles of <Name A> whose unit count is at 
 Question: Show the 10 largest properties by unit count in <a state value> as a pie chart
 {"intent":"list","property_names":[],"nearby_count":10,"max_distance_miles":null,"constraints":[{"field":"State","op":"eq","value":"<a state value>"}],"fields":[],"unsupported":[],"data_view":null,"metrics":["units"],"metric_constraints":[],"sort":{"metric":"units","direction":"desc"},"period":null,"visualization":"pie","chart_metric":"units"}
 
+Question: Compare these properties with nearby properties within 10 miles   (context lists properties already shown)
+{"intent":"compare","property_names":[],"nearby_count":null,"max_distance_miles":10,"constraints":[],"fields":[],"unsupported":[],"data_view":null,"location":null,"context_ref":"results","new_topic":false,"include_nearby":true,"response_focus":"compare"}
+Question: Find properties in Austin, TX
+{"intent":"list","property_names":[],"nearby_count":null,"max_distance_miles":null,"constraints":[],"fields":[],"unsupported":[],"data_view":null,"location":{"text":"Austin, TX","type":"city"},"context_ref":"none","new_topic":null,"include_nearby":false,"response_focus":"locate"}
+
 Respond with the JSON object only."""
 
 
-def _build_prompt(catalog: str) -> str:
+class IntentServiceError(Exception):
+    """The language-understanding step failed. `code` is safe to show to the user."""
+
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
+def _build_prompt(catalog: str, context: str = "") -> str:
     text = catalog.strip() if catalog else "(none available)"
-    return SYSTEM_PROMPT.replace("{catalog}", text)
+    ctx = context.strip() if context else "(none)"
+    return SYSTEM_PROMPT.replace("{catalog}", text).replace("{context}", ctx)
 
 
-def _call_model(user_query: str, catalog: str = "") -> str:
+def _call_model(user_query: str, catalog: str = "", context: str = "") -> str:
     validate_ask_ai_settings()
 
     headers = {
@@ -96,7 +128,7 @@ def _call_model(user_query: str, catalog: str = "") -> str:
     payload = {
         "model": settings.ASK_AI_MODEL_NAME,
         "messages": [
-            {"role": "system", "content": _build_prompt(catalog)},
+            {"role": "system", "content": _build_prompt(catalog, context)},
             {"role": "user", "content": user_query},
         ],
         "temperature": 0,
@@ -174,6 +206,11 @@ def _empty_result() -> dict:
         "period": None,
         "visualization": None,
         "chart_metric": None,
+        "location": None,
+        "context_ref": "none",
+        "new_topic": None,
+        "include_nearby": False,
+        "response_focus": None,
     }
 
 
@@ -203,10 +240,10 @@ def _is_transient(error: Exception) -> bool:
     return False
 
 
-def _call_model_with_retry(user_query: str, catalog: str, attempts: int = 2) -> str:
+def _call_model_with_retry(user_query: str, catalog: str, context: str = "", attempts: int = 2) -> str:
     for attempt in range(1, attempts + 1):
         try:
-            return _call_model(user_query, catalog)
+            return _call_model(user_query, catalog, context)
         except Exception as e:
             if attempt >= attempts or not _is_transient(e):
                 raise
@@ -215,17 +252,23 @@ def _call_model_with_retry(user_query: str, catalog: str, attempts: int = 2) -> 
     return ""
 
 
-def resolve_intent(user_query: str, catalog: str = "") -> dict:
+def resolve_intent(user_query: str, catalog: str = "", context: str = "") -> dict:
     try:
-        raw = _call_model_with_retry(user_query, catalog)
+        raw = _call_model_with_retry(user_query, catalog, context)
+    except requests.exceptions.Timeout as e:
+        logger.error("Ask AI model timed out: %s", type(e).__name__)
+        raise IntentServiceError("ai_timeout")
+    except RuntimeError as e:
+        logger.error("Ask AI is not configured: %s", e)
+        raise IntentServiceError("service_not_configured")
     except Exception as e:
-        logger.error("Ask AI model call failed: %s", e)
-        return _empty_result()
+        logger.error("Ask AI model call failed: %s: %s", type(e).__name__, e)
+        raise IntentServiceError("ai_unavailable")
 
     parsed = _extract_json(raw)
     if parsed is None:
         logger.error("Ask AI returned no parseable JSON | raw=%s", raw[:500])
-        return _empty_result()
+        raise IntentServiceError("ai_bad_response")
 
     intent = parsed.get("intent", "unknown")
     if intent not in ("search", "nearest", "compare", "list", "unknown"):
@@ -251,7 +294,28 @@ def resolve_intent(user_query: str, catalog: str = "") -> dict:
     visualization = parsed.get("visualization")
     chart_metric = parsed.get("chart_metric")
 
+    location = parsed.get("location")
+    if isinstance(location, str):
+        location = {"text": location, "type": None}
+    if isinstance(location, dict) and str(location.get("text") or "").strip():
+        loc_type = str(location.get("type") or "").strip().lower() or None
+        location = {"text": str(location["text"]).strip()[:200], "type": loc_type}
+    else:
+        location = None
+    context_ref = str(parsed.get("context_ref") or "none").strip().lower()
+    if context_ref not in ("none", "results", "reference"):
+        context_ref = "none"
+    new_topic = parsed.get("new_topic")
+    focus = str(parsed.get("response_focus") or "").strip().lower() or None
+    if focus not in ("locate", "compare", "financial", "analysis"):
+        focus = None
+
     return {
+        "location": location,
+        "context_ref": context_ref,
+        "new_topic": new_topic if isinstance(new_topic, bool) else None,
+        "include_nearby": bool(parsed.get("include_nearby")),
+        "response_focus": focus,
         "intent": intent,
         "property_names": names,
         "nearby_count": _positive_int(parsed.get("nearby_count")),
