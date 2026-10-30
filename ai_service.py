@@ -1,12 +1,40 @@
+import copy
+import hashlib
 import json
 import logging
 import re
 import time
 import requests
+from requests.adapters import HTTPAdapter
 import financial_service
+from cache import KeyedTTLCache
 from config import settings, validate_ask_ai_settings
 
 logger = logging.getLogger(__name__)
+
+# One pooled session: re-uses the TCP/TLS connection to the model endpoint instead of paying a fresh
+# handshake (typically 100-400 ms) on every question.
+_session = requests.Session()
+_session.mount("https://", HTTPAdapter(pool_connections=4, pool_maxsize=16))
+_session.mount("http://", HTTPAdapter(pool_connections=4, pool_maxsize=16))
+
+_intent_cache = KeyedTTLCache(
+    ttl_seconds=max(1, settings.INTENT_CACHE_TTL_SECONDS),
+    max_entries=settings.INTENT_CACHE_MAX_ENTRIES,
+    name="intent",
+)
+
+
+def _extra_params() -> dict:
+    raw = settings.ASK_AI_EXTRA_PARAMS
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        logger.warning("ASK_AI_EXTRA_PARAMS is not valid JSON; ignoring it.")
+        return {}
+    return value if isinstance(value, dict) else {}
 
 SYSTEM_PROMPT = """You are an intent parser for a commercial real estate property intelligence system.
 Convert the user's question into ONE raw JSON object and output nothing else: no markdown fences, no explanations.
@@ -48,7 +76,7 @@ Location and conversation rules:
 - include_nearby: true when the user wants nearby properties included alongside the named or referenced ones (for example "compare these with nearby properties within 10 miles").
 - response_focus: "locate" for finding/listing/showing properties (including nearby searches), "compare" for comparing properties, "financial" for questions mainly about financial figures, "analysis" for broad analysis across a portfolio, several states or markets. null if unclear.
 - When the user names several states, cities or markets (\"across Texas and Florida\"), use a constraint such as State in [\"TX\",\"FL\"] instead of location, and set response_focus to \"analysis\".
-- When the user only changes the distance ("what about 15 miles?"), set context_ref to "reference".
+- When the user only changes the distance ("what about 15 miles?"), set context_ref to "reference".
 - Resolve references using the conversation context. Do NOT copy property names from the context into property_names; use context_ref instead.
 
 Field rules:
@@ -134,8 +162,9 @@ def _call_model(user_query: str, catalog: str = "", context: str = "") -> str:
         "temperature": 0,
         "max_tokens": settings.ASK_AI_MAX_TOKENS,
     }
+    payload.update(_extra_params())
 
-    response = requests.post(
+    response = _session.post(
         settings.ASK_AI_ENDPOINT,
         headers=headers,
         json=payload,
@@ -253,6 +282,16 @@ def _call_model_with_retry(user_query: str, catalog: str, context: str = "", att
 
 
 def resolve_intent(user_query: str, catalog: str = "", context: str = "") -> dict:
+    """Parsed intent for a question. Identical (question, context, catalog) triples are served from memory."""
+    if settings.INTENT_CACHE_TTL_SECONDS <= 0:
+        return _resolve_intent_uncached(user_query, catalog, context)
+    digest = hashlib.sha1((catalog or "").encode("utf-8")).hexdigest()
+    key = (" ".join((user_query or "").lower().split()), (context or "").strip(), digest)
+    # Callers mutate the returned dict, so every caller gets its own copy.
+    return copy.deepcopy(_intent_cache.get(key, lambda: _resolve_intent_uncached(user_query, catalog, context)))
+
+
+def _resolve_intent_uncached(user_query: str, catalog: str = "", context: str = "") -> dict:
     try:
         raw = _call_model_with_retry(user_query, catalog, context)
     except requests.exceptions.Timeout as e:

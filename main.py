@@ -1,5 +1,6 @@
 import logging
 import secrets
+import time
 import json
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -72,6 +73,9 @@ class AskAIRequest(BaseModel):
     top_accounts: Optional[int] = None
     chart: Optional[str] = None
     context: Optional[dict] = None
+    # When true, /ask-ai answers immediately and tells the client which properties still need financials
+    # (financials_pending / financial_keys / financial_view); the client then fetches them separately.
+    defer_financials: bool = False
 
 
 class SelectionRequest(BaseModel):
@@ -156,6 +160,14 @@ def warm_cache():
         logger.info("Startup cache warm: GL account lookup loaded.")
     except Exception as e:
         logger.error("GL account warm-up failed at startup: %s", e)
+
+    # The unit-months query is the heaviest load in the app; before this it was only loaded by whichever
+    # user question (or /admin/unit-diagnostics call) arrived first.
+    try:
+        unit_service.warm()
+        logger.info("Startup cache warm: unit months and product units loaded.")
+    except Exception as e:
+        logger.error("Unit warm-up failed at startup: %s", e)
 
 
 @app.get("/health")
@@ -505,6 +517,8 @@ def _financial_bundle(keys: list, view: Optional[str], req: "AskAIRequest") -> t
     notes = []
     if len(keys) > len(limited):
         notes.append(f"Financial figures are shown for the first {len(limited)} of {len(keys)} properties.")
+    if getattr(req, "defer_financials", False):
+        return {"financials_pending": True, "financial_keys": limited, "financial_view": view}, notes
     payload = _financial_payload(limited, view, req.year_month_from, req.year_month_to, req.top_accounts)
     return payload, notes
 
@@ -606,7 +620,9 @@ def _build_plan(req: "AskAIRequest") -> dict:
     ctx = context_service.clean(req.context)
     names_by_key = property_service.name_lookup() if ctx else {}
     summary = context_service.prompt_summary(ctx, lambda k: names_by_key.get(str(k)))
+    llm_started = time.perf_counter()
     parsed = ai_service.resolve_intent(req.query, query_service.catalog_prompt(), summary)
+    llm_ms = round((time.perf_counter() - llm_started) * 1000)
     intent = parsed["intent"]
     decision = context_service.decide(parsed, ctx, req.query)
     ctx_keys = context_service.keys_for(ctx, decision["use"])
@@ -667,6 +683,7 @@ def _build_plan(req: "AskAIRequest") -> dict:
     ym_from, ym_to = _plan_period(req, parsed)
 
     return {
+        "llm_ms": llm_ms,
         "parsed": parsed,
         "intent": intent,
         "names": parsed["property_names"],
@@ -870,9 +887,24 @@ def _finalize(response: dict, req: "AskAIRequest", plan: dict, reference_keys: l
 
 
 def _ask_ai(req: AskAIRequest):
+    started = time.perf_counter()
     plan = _build_plan(req)
+    planned = time.perf_counter()
     response = _execute(req, plan)
-    return _present(response, plan)
+    executed = time.perf_counter()
+    response = _present(response, plan)
+    done = time.perf_counter()
+    timings = {
+        "llm": plan.get("llm_ms", 0),
+        "plan": round((planned - started) * 1000),
+        "execute": round((executed - planned) * 1000),
+        "present": round((done - executed) * 1000),
+        "total": round((done - started) * 1000),
+    }
+    logger.info("ask-ai timings_ms=%s intent=%s", timings, plan.get("intent"))
+    if isinstance(response, dict):
+        response["timings_ms"] = timings
+    return response
 
 
 def _empty_response(plan: dict, req: "AskAIRequest", code: str, message: str, intent: str,

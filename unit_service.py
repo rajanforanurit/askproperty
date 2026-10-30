@@ -206,6 +206,16 @@ def get_monthly(force_refresh: bool = False) -> pd.DataFrame:
     return _monthly_cache.get(force_refresh=force_refresh)
 
 
+def warm() -> None:
+    """Load every unit cache. Call at startup so no user question pays for the first load."""
+    get_monthly(force_refresh=True)
+    _product_units_cache.get(force_refresh=True)
+
+
+_period_memo: dict = {}
+_PERIOD_MEMO_MAX = 32
+
+
 def refresh() -> dict:
     monthly = get_monthly(force_refresh=True)
     _product_units_cache.get(force_refresh=True)
@@ -344,7 +354,21 @@ def get_period_metrics(ym_from=None, ym_to=None, keys=None) -> tuple:
             frame = frame[frame["PropertyBizKey"].isin([str(k).strip() for k in keys])]
         meta = {"year_month_from": None, "year_month_to": None, "calendar_days": None, "source": "product_table"}
         return frame.reset_index(drop=True), meta
-    frame = compute_period_metrics(monthly, period[0], period[1], keys)
+    if keys is None:
+        # The all-properties aggregation scans the whole monthly frame and is requested several times per
+        # question with identical arguments. Memoise it per loaded frame; each caller still gets its own copy.
+        memo_key = (period[0], period[1])
+        hit = _period_memo.get(memo_key)
+        if hit is not None and hit[0] is monthly:
+            frame = hit[1].copy()
+        else:
+            computed = compute_period_metrics(monthly, period[0], period[1], None)
+            if len(_period_memo) >= _PERIOD_MEMO_MAX:
+                _period_memo.clear()
+            _period_memo[memo_key] = (monthly, computed)
+            frame = computed.copy()
+    else:
+        frame = compute_period_metrics(monthly, period[0], period[1], keys)
     meta = {
         "year_month_from": period[0],
         "year_month_to": period[1],

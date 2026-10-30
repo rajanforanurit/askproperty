@@ -86,6 +86,12 @@ class Settings:
     ASK_AI_MODEL_NAME: str = os.getenv("ASK_AI_MODEL_NAME", "")
     ASK_AI_TIMEOUT_SECONDS: int = int(os.getenv("ASK_AI_TIMEOUT_SECONDS", "30"))
     ASK_AI_MAX_TOKENS: int = int(os.getenv("ASK_AI_MAX_TOKENS", "1500"))
+    # Optional JSON merged into the model request, e.g. {"reasoning_effort":"low"} or
+    # {"response_format":{"type":"json_object"}}. Empty = send nothing extra (previous behaviour).
+    ASK_AI_EXTRA_PARAMS: str = os.getenv("ASK_AI_EXTRA_PARAMS", "").strip()
+    # Seconds an identical question (same conversation context) reuses the parsed intent. 0 disables.
+    INTENT_CACHE_TTL_SECONDS: int = int(os.getenv("INTENT_CACHE_TTL_SECONDS", "600"))
+    INTENT_CACHE_MAX_ENTRIES: int = int(os.getenv("INTENT_CACHE_MAX_ENTRIES", "256"))
 
     SECRET_KEY: str = os.getenv("SECRET_KEY", "")
 
