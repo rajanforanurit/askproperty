@@ -1,4 +1,5 @@
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
@@ -38,22 +39,56 @@ ACCOUNT_CATEGORY_CANDIDATES = [
 ]
 ACCOUNT_CODE_CANDIDATES = ["GLAccountCode", "AccountCode", "GLAccountNumber", "AccountNumber"]
 
-SECTION_LABELS = {
-    "revenue": "Revenue",
-    "operating_expenses": "Operating Expenses",
-    "capital_expenses": "Capital Expenses",
-    "replacements": "Replacements",
-    "other": "Other",
-}
-
-SUMMARY_LINES = [
-    ("revenue", "Revenue"),
-    ("operating_expenses", "Operating Expenses"),
-    ("noi", "Net Operating Income"),
-    ("capital_expenses", "Capital Expenses"),
-    ("replacements", "Replacements"),
-    ("net_cash_flow", "Net Cash Flow After Capital"),
+# ---------------------------------------------------------------------------------------------
+# The ONLY financial lines this service returns (operating expense report).
+# Detail lines are matched by name against the GL account hierarchy (every "GL Account Level N"
+# column, deepest first, then the account name). Subtotals and the grand total are always
+# calculated here from the detail lines, never read from the database, so they cannot double count.
+# ---------------------------------------------------------------------------------------------
+EXPENSE_GROUPS = [
+    {
+        "key": "total_property_level_expenses",
+        "label": "TOTAL PROPERTY LEVEL EXPENSES",
+        "items": [
+            ("administrative", "ADMINISTRATIVE"),
+            ("advertising_promo", "ADVERTISING PROMO"),
+            ("professional_fees", "PROFESSIONAL FEES"),
+            ("repair_and_maint_expenses", "REPAIR AND MAINT EXPENSES"),
+            ("payroll_expense", "PAYROLL EXPENSE"),
+            ("utility_expense", "UTILITY EXPENSE"),
+        ],
+    },
+    {
+        "key": "total_noncontrollable_expenses",
+        "label": "TOTAL NONCONTROLLABLE EXPENSES",
+        "items": [
+            ("insurance_expense", "INSURANCE EXPENSE"),
+            ("re_tax", "RE TAX"),
+        ],
+    },
 ]
+GRAND_TOTAL_KEY = "total_operating_expenses"
+GRAND_TOTAL_LABEL = "TOTAL OPERATING EXPENSES"
+
+UNASSIGNED_GROUP = "_unassigned_group"
+
+
+def _norm_label(value) -> str:
+    """'Repair & Maint. Expenses' -> 'REPAIR MAINT EXPENSES' (case/punctuation/'and' insensitive)."""
+    if value is None:
+        return ""
+    cleaned = re.sub(r"[^A-Z0-9]+", " ", str(value).upper()).strip()
+    return " ".join(w for w in cleaned.split() if w != "AND")
+
+
+ITEM_LOOKUP = {
+    _norm_label(label): (key, label, group["key"])
+    for group in EXPENSE_GROUPS
+    for key, label in group["items"]
+}
+GROUP_LOOKUP = {_norm_label(g["label"]): g["key"] for g in EXPENSE_GROUPS}
+ALL_LINE_KEYS = [key for g in EXPENSE_GROUPS for key, _ in g["items"]]
+LEVEL_COLUMN_RE = re.compile(r"^\s*GL Account Level\s*(\d+)\s*$", re.IGNORECASE)
 
 
 def normalize_view(value) -> Optional[str]:
@@ -119,21 +154,6 @@ def _records(df: pd.DataFrame) -> list:
     return df.astype(object).where(pd.notna(df), None).to_dict(orient="records")
 
 
-def _classify_section(level2, level3) -> str:
-    l2 = (level2 or "").lower()
-    l3 = (level3 or "").lower()
-    if "capital expense" in l2:
-        return "capital_expenses"
-    if "replacement" in l2:
-        return "replacements"
-    if "net operating income" in l2:
-        if "revenue" in l3:
-            return "revenue"
-        if "operating expense" in l3:
-            return "operating_expenses"
-    return "other"
-
-
 def _find_column(df, override, candidates, contains, exclude, taken):
     lookup = {str(c).lower(): c for c in df.columns}
     if override and override.strip().lower() in lookup:
@@ -148,6 +168,27 @@ def _find_column(df, override, candidates, contains, exclude, taken):
             continue
         if any(token in low for token in contains) and not any(token in low for token in exclude):
             return column
+    return None
+
+
+def _match_line(level_values: list, name):
+    """Return (line_key, path) for one GL account.
+
+    level_values is ordered shallow -> deep. The deepest level that names one of the detail lines wins,
+    so a parent bucket can never be counted together with its own children. If the account sits under a
+    TOTAL group name but matches no detail line, it is flagged so it can be reported instead of silently
+    inflating a total.
+    """
+    for value in reversed(level_values):
+        hit = ITEM_LOOKUP.get(_norm_label(value))
+        if hit:
+            return hit[0]
+    hit = ITEM_LOOKUP.get(_norm_label(name))
+    if hit:
+        return hit[0]
+    for value in level_values:
+        if _norm_label(value) in GROUP_LOOKUP:
+            return UNASSIGNED_GROUP
     return None
 
 
@@ -173,47 +214,57 @@ def _load_gl_accounts() -> dict:
                             ["name", "description"], ["key"], taken)
     if name_col is not None:
         taken.add(name_col)
-    category_col = _find_column(df, settings.GL_ACCOUNT_CATEGORY_COLUMN, ACCOUNT_CATEGORY_CANDIDATES,
-                                ["category", "type", "group", "class"], ["key"], taken)
-    if category_col is not None:
-        taken.add(category_col)
     code_col = _find_column(df, settings.GL_ACCOUNT_CODE_COLUMN, ACCOUNT_CODE_CANDIDATES,
                             ["code", "number"], ["key", "book"], taken)
-    level2_col = _find_column(df, settings.GL_ACCOUNT_LEVEL2_COLUMN, ["GL Account Level 2"], [], [], set())
-    level3_col = _find_column(df, settings.GL_ACCOUNT_LEVEL3_COLUMN, ["GL Account Level 3"], [], [], set())
+
+    level_cols = sorted(
+        ((int(m.group(1)), c) for c in df.columns if (m := LEVEL_COLUMN_RE.match(str(c)))),
+        key=lambda pair: pair[0],
+    )
+    level_cols = [c for _, c in level_cols]
+    if not level_cols:
+        state["error"] = "No 'GL Account Level N' columns found in the GL account table."
+        return state
 
     work = df.copy()
     work["_account_key"] = pd.to_numeric(work[key_col], errors="coerce")
     work = work.dropna(subset=["_account_key"]).drop_duplicates(subset=["_account_key"])
 
+    only_under = _norm_label(settings.OPEX_ROOT_FILTER) if settings.OPEX_ROOT_FILTER else ""
+
     lookup = {}
-    section_counts = {}
+    line_counts = {}
+    line_paths = {}
     for record in work.to_dict(orient="records"):
         account_key = int(record["_account_key"])
+        levels = [_text(record.get(c)) for c in level_cols]
         name = _text(record.get(name_col)) if name_col is not None else None
-        level2 = _text(record.get(level2_col)) if level2_col is not None else None
-        level3 = _text(record.get(level3_col)) if level3_col is not None else None
-        section = _classify_section(level2, level3)
-        section_counts[section] = section_counts.get(section, 0) + 1
+        line = _match_line(levels, name)
+        if line and only_under:
+            if not any(only_under in _norm_label(v) for v in levels if v):
+                line = None
+        if line is None:
+            continue
         lookup[account_key] = {
             "GLAccountCode": _text(record.get(code_col)) if code_col is not None else None,
             "GLAccountName": name or f"Account {account_key}",
-            "GLAccountCategory": _text(record.get(category_col)) if category_col is not None else None,
-            "GLAccountSection": SECTION_LABELS[section],
-            "_section": section,
+            "_line": line,
         }
+        line_counts[line] = line_counts.get(line, 0) + 1
+        paths = line_paths.setdefault(line, set())
+        if len(paths) < 6:
+            paths.add(" > ".join(v for v in levels if v))
 
     state["loaded"] = True
     state["lookup"] = lookup
     state["columns"] = {
         "key": str(key_col),
         "name": str(name_col) if name_col is not None else None,
-        "category": str(category_col) if category_col is not None else None,
         "code": str(code_col) if code_col is not None else None,
-        "level2": str(level2_col) if level2_col is not None else None,
-        "level3": str(level3_col) if level3_col is not None else None,
+        "levels": [str(c) for c in level_cols],
     }
-    state["section_counts"] = section_counts
+    state["line_counts"] = line_counts
+    state["line_paths"] = {k: sorted(v) for k, v in line_paths.items()}
     return state
 
 
@@ -233,26 +284,6 @@ def _gl_state() -> dict:
     if not state["loaded"]:
         _gl_accounts_cache.invalidate()
     return state
-
-
-def _account_info(account_key) -> dict:
-    account_key = int(account_key)
-    info = _gl_state()["lookup"].get(account_key)
-    if info is None:
-        return {
-            "GLAccountCode": None,
-            "GLAccountName": f"Account {account_key}",
-            "GLAccountCategory": None,
-            "GLAccountSection": SECTION_LABELS["other"],
-        }
-    return {k: v for k, v in info.items() if not k.startswith("_")}
-
-
-def _section_key(account_key) -> str:
-    info = _gl_state()["lookup"].get(int(account_key))
-    if info is None:
-        return "other"
-    return info["_section"]
 
 
 def warm():
@@ -413,31 +444,56 @@ def _resolve_period(keys: list, ym_from, ym_to, view: Optional[str] = None):
 
 
 def _apply_account_scope(frames: dict):
+    """Keep only accounts that belong to one of the operating expense lines and tag them with that line.
+
+    Expenses are stored as negative dollars in the GL; OPEX_SIGN_MULTIPLIER (default -1) turns them into
+    the positive figures shown in the operating expense report.
+    """
     excluded = {}
     notes = []
-    if settings.INCLUDE_UNMAPPED_ACCOUNTS:
-        return frames, excluded, notes
-
     state = _gl_state()
     if not state["loaded"]:
-        notes.append("GL account table is unavailable, so accounts outside the cash flow hierarchy could not be excluded.")
-        return frames, excluded, notes
+        notes.append("GL account table is unavailable, so operating expense lines could not be identified.")
+        return {k: _empty_frame_with_line() for k in frames}, excluded, notes
 
-    known = list(state["lookup"].keys())
+    line_of = {key: info["_line"] for key, info in state["lookup"].items()}
+    sign = settings.OPEX_SIGN_MULTIPLIER
     scoped = {}
+    unassigned_amount = 0.0
     for kind, frame in frames.items():
         if frame.empty:
-            scoped[kind] = frame
+            scoped[kind] = _empty_frame_with_line()
             excluded[kind] = {"accounts": 0, "amount": 0.0}
             continue
-        mask = frame["GLAccountKey"].isin(known)
-        dropped = frame.loc[~mask]
+        tagged = frame.copy()
+        tagged["Line"] = tagged["GLAccountKey"].map(line_of)
+        outside = tagged[tagged["Line"].isna()]
         excluded[kind] = {
-            "accounts": int(dropped["GLAccountKey"].nunique()),
-            "amount": round(float(dropped["Amount"].sum()), 2),
+            "accounts": int(outside["GLAccountKey"].nunique()),
+            "amount": round(float(outside["Amount"].sum()), 2),
         }
-        scoped[kind] = frame.loc[mask].reset_index(drop=True)
+        stray = tagged[tagged["Line"] == UNASSIGNED_GROUP]
+        if not stray.empty:
+            unassigned_amount += float(stray["Amount"].sum()) * sign
+            notes.append(
+                f"{kind.capitalize()}: {stray['GLAccountKey'].nunique()} account(s) sit under a TOTAL expense group "
+                f"but match none of its detail lines ({round(float(stray['Amount'].sum()) * sign, 2)}); excluded."
+            )
+        kept = tagged[tagged["Line"].isin(ALL_LINE_KEYS)].copy()
+        kept["Amount"] = kept["Amount"] * sign
+        scoped[kind] = kept.reset_index(drop=True)
+
+    counts = state.get("line_counts", {})
+    missing = [label for g in EXPENSE_GROUPS for key, label in g["items"] if not counts.get(key)]
+    if missing:
+        notes.append("No GL accounts matched these lines (check the GL hierarchy names): " + ", ".join(missing))
     return scoped, excluded, notes
+
+
+def _empty_frame_with_line() -> pd.DataFrame:
+    frame = _empty_frame()
+    frame["Line"] = pd.Series(dtype="object")
+    return frame
 
 
 def _load(view: str, keys: list, ym_from, ym_to):
@@ -503,79 +559,85 @@ def _row_amounts(record: dict, view: str) -> dict:
     return _amounts(record.get("actual", 0.0), record.get("budget", 0.0), view)
 
 
-def _add_sort_column(df: pd.DataFrame, view: str) -> pd.DataFrame:
-    if view == "actual":
-        df["_sort"] = df["actual"].abs()
-    elif view == "budget":
-        df["_sort"] = df["budget"].abs()
+def _per_unit(amount: float, units) -> Optional[float]:
+    try:
+        count = float(units)
+    except (TypeError, ValueError):
+        return None
+    if not count:
+        return None
+    return round(amount / count, 2)
+
+
+def _with_units(base: dict, view: str, units) -> dict:
+    """Add the report's '$ Per Unit' figure next to each amount."""
+    result = dict(base)
+    result["units"] = units
+    if view == "both":
+        result["actual_per_unit"] = _per_unit(base["actual"], units)
+        result["budget_per_unit"] = _per_unit(base["budget"], units)
     else:
-        df["_sort"] = df[["actual", "budget"]].abs().max(axis=1)
-    return df
+        result["per_unit"] = _per_unit(base["value"], units)
+    return result
 
 
-def _ordered_lines(include_other: bool) -> list:
-    lines = list(SUMMARY_LINES)
-    if include_other:
-        lines.insert(len(lines) - 1, ("other", "Other / Unmapped"))
-    return lines
-
-
-def _section_pairs(frames: dict, by_property: bool) -> dict:
-    group_cols = ["PropertyBizKey", "Section"] if by_property else ["Section"]
-    tagged = {}
-    for kind, frame in frames.items():
-        copy = frame.copy()
-        sections = {key: info["_section"] for key, info in _gl_state()["lookup"].items()}
-        copy["Section"] = copy["GLAccountKey"].map(lambda k: sections.get(int(k), "other")).astype(object)
-        tagged[kind] = copy
-    table = _merge_amounts(tagged, group_cols)
+def _line_pairs(frames: dict, by_property: bool) -> dict:
+    """{owner: {line_key: (actual, budget)}} where owner is a PropertyBizKey, or '' when not by_property."""
+    group_cols = ["PropertyBizKey", "Line"] if by_property else ["Line"]
+    table = _merge_amounts(frames, group_cols)
     pairs = {}
     for record in table.to_dict(orient="records"):
         owner = record["PropertyBizKey"] if by_property else ""
-        pairs.setdefault(owner, {})[record["Section"]] = (record.get("actual", 0.0), record.get("budget", 0.0))
+        pairs.setdefault(owner, {})[record["Line"]] = (record.get("actual", 0.0), record.get("budget", 0.0))
     return pairs
 
 
-def _line_values(section_pairs: dict) -> dict:
-    def pick(key):
-        return section_pairs.get(key, (0.0, 0.0))
-
-    revenue = pick("revenue")
-    opex = pick("operating_expenses")
-    return {
-        "revenue": revenue,
-        "operating_expenses": opex,
-        "noi": (revenue[0] + opex[0], revenue[1] + opex[1]),
-        "capital_expenses": pick("capital_expenses"),
-        "replacements": pick("replacements"),
-        "other": pick("other"),
-        "net_cash_flow": (
-            sum(p[0] for p in section_pairs.values()),
-            sum(p[1] for p in section_pairs.values()),
-        ),
-    }
+def _add(a: tuple, b: tuple) -> tuple:
+    return (a[0] + b[0], a[1] + b[1])
 
 
-def _summary_single(frames: dict, view: str) -> list:
-    values = _line_values(_section_pairs(frames, False).get("", {}))
-    include_other = any(values["other"])
+def _report_values(line_pairs: dict) -> list:
+    """Ordered report rows [(key, label, level, parent, (actual, budget))] with calculated totals."""
+    rows = []
+    grand = (0.0, 0.0)
+    for group in EXPENSE_GROUPS:
+        children = []
+        subtotal = (0.0, 0.0)
+        for key, label in group["items"]:
+            value = line_pairs.get(key, (0.0, 0.0))
+            subtotal = _add(subtotal, value)
+            children.append((key, label, "item", group["key"], value))
+        rows.append((group["key"], group["label"], "total", None, subtotal))
+        rows.extend(children)
+        grand = _add(grand, subtotal)
+    rows.append((GRAND_TOTAL_KEY, GRAND_TOTAL_LABEL, "grand_total", None, grand))
+    return rows
+
+
+def _line_items_single(frames: dict, view: str, units) -> list:
+    values = _report_values(_line_pairs(frames, False).get("", {}))
     return [
-        {"key": key, "label": label, **_amounts(values[key][0], values[key][1], view)}
-        for key, label in _ordered_lines(include_other)
+        {"key": key, "label": label, "level": level, "parent": parent,
+         **_with_units(_amounts(pair[0], pair[1], view), view, units)}
+        for key, label, level, parent, pair in values
     ]
 
 
-def _summary_matrix(frames: dict, view: str, keys: list) -> list:
-    pairs = _section_pairs(frames, True)
-    per_owner = {owner: _line_values(pairs.get(owner, {})) for owner in keys}
-    include_other = any(any(v["other"]) for v in per_owner.values())
+def _line_items_matrix(frames: dict, view: str, keys: list, units_by_key: dict) -> list:
+    pairs = _line_pairs(frames, True)
+    per_owner = {owner: _report_values(pairs.get(owner, {})) for owner in keys}
     rows = []
-    for key, label in _ordered_lines(include_other):
+    for index, (key, label, level, parent, _) in enumerate(per_owner[keys[0]]):
         rows.append({
             "key": key,
             "label": label,
+            "level": level,
+            "parent": parent,
             "values": {
-                owner: _amounts(per_owner[owner][key][0], per_owner[owner][key][1], view)
+                owner: _with_units(
+                    _amounts(per_owner[owner][index][4][0], per_owner[owner][index][4][1], view),
+                    view, units_by_key.get(owner),
+                )
                 for owner in keys
             },
         })
@@ -590,39 +652,28 @@ def _frame_total(frames: dict, kind: str) -> float:
 
 
 def get_property_financials(biz_key, view=None, ym_from=None, ym_to=None, top_accounts=None) -> dict:
+    """Operating expense report for one property. top_accounts is accepted for API compatibility and ignored."""
     view = normalize_view(view) or "actual"
     key = str(biz_key).strip()
     props = _property_lookup([key])
     if key not in props:
         raise ValueError(f"Property '{key}' not found.")
+    units = props[key].get("Units")
 
     period, frames, excluded, notes = _load(view, [key], ym_from, ym_to)
     books, warnings = _books_and_warnings(frames)
     warnings = warnings + notes
     has_data = any(not frame.empty for frame in frames.values())
 
-    totals = _amounts(_frame_total(frames, "actual"), _frame_total(frames, "budget"), view)
+    totals = _with_units(
+        _amounts(_frame_total(frames, "actual"), _frame_total(frames, "budget"), view), view, units
+    )
 
-    accounts = []
     months = []
     if has_data:
-        account_df = _add_sort_column(_merge_amounts(frames, ["GLAccountKey"]), view)
-        account_df = account_df.sort_values("_sort", ascending=False)
-        if top_accounts:
-            account_df = account_df.head(int(top_accounts))
-        for record in account_df.to_dict(orient="records"):
-            accounts.append({
-                "GLAccountKey": int(record["GLAccountKey"]),
-                **_account_info(record["GLAccountKey"]),
-                **_row_amounts(record, view),
-            })
-
         month_df = _merge_amounts(frames, ["YearMonthKey"]).sort_values("YearMonthKey")
         for record in month_df.to_dict(orient="records"):
-            months.append({
-                "YearMonthKey": int(record["YearMonthKey"]),
-                **_row_amounts(record, view),
-            })
+            months.append({"YearMonthKey": int(record["YearMonthKey"]), **_row_amounts(record, view)})
 
     return {
         "view": view,
@@ -630,16 +681,16 @@ def get_property_financials(biz_key, view=None, ym_from=None, ym_to=None, top_ac
         "period": period,
         "books": books,
         "has_data": has_data,
-        "excluded_unmapped": excluded,
+        "excluded_other_accounts": excluded,
         "totals": totals,
-        "summary": _summary_single(frames, view),
-        "accounts": accounts,
+        "line_items": _line_items_single(frames, view, units),
         "months": months,
         "warnings": warnings,
     }
 
 
 def compare_financials(biz_keys, view=None, ym_from=None, ym_to=None, top_accounts=None) -> dict:
+    """Operating expense report side by side for several properties."""
     view = normalize_view(view) or "actual"
     keys = _clean_keys(biz_keys)
     if not keys:
@@ -655,8 +706,7 @@ def compare_financials(biz_keys, view=None, ym_from=None, ym_to=None, top_accoun
             "period": None,
             "books": {},
             "properties": [],
-            "summary": [],
-            "accounts": [],
+            "line_items": [],
             "not_found": not_found,
             "no_data": [],
             "warnings": [],
@@ -666,14 +716,12 @@ def compare_financials(biz_keys, view=None, ym_from=None, ym_to=None, top_accoun
     books, warnings = _books_and_warnings(frames)
     warnings = warnings + notes
     has_data = any(not frame.empty for frame in frames.values())
+    units_by_key = {k: props[k].get("Units") for k in found}
 
     totals_map = {}
-    matrix_records = []
     if has_data:
         totals_df = _merge_amounts(frames, ["PropertyBizKey"])
         totals_map = {rec["PropertyBizKey"]: rec for rec in totals_df.to_dict(orient="records")}
-        matrix_df = _add_sort_column(_merge_amounts(frames, ["GLAccountKey", "PropertyBizKey"]), view)
-        matrix_records = matrix_df.to_dict(orient="records")
 
     property_rows = []
     no_data = []
@@ -684,39 +732,16 @@ def compare_financials(biz_keys, view=None, ym_from=None, ym_to=None, top_accoun
         property_rows.append({
             **props[key],
             "has_data": record is not None,
-            **_row_amounts(record or {}, view),
-        })
-
-    by_account = {}
-    account_weight = {}
-    for record in matrix_records:
-        account_key = int(record["GLAccountKey"])
-        by_account.setdefault(account_key, {})[record["PropertyBizKey"]] = record
-        account_weight[account_key] = account_weight.get(account_key, 0.0) + float(record["_sort"])
-
-    ordered_accounts = sorted(account_weight, key=lambda k: account_weight[k], reverse=True)
-    if top_accounts:
-        ordered_accounts = ordered_accounts[: int(top_accounts)]
-
-    account_rows = []
-    for account_key in ordered_accounts:
-        values = {}
-        for key in found:
-            values[key] = _row_amounts(by_account[account_key].get(key, {}), view)
-        account_rows.append({
-            "GLAccountKey": account_key,
-            **_account_info(account_key),
-            "values": values,
+            **_with_units(_row_amounts(record or {}, view), view, units_by_key[key]),
         })
 
     return {
         "view": view,
         "period": period,
         "books": books,
-        "excluded_unmapped": excluded,
+        "excluded_other_accounts": excluded,
         "properties": property_rows,
-        "summary": _summary_matrix(frames, view, found),
-        "accounts": account_rows,
+        "line_items": _line_items_matrix(frames, view, found, units_by_key),
         "not_found": not_found,
         "no_data": no_data,
         "warnings": warnings,
@@ -746,7 +771,8 @@ def diagnostics() -> dict:
             "budget_value_column": settings.BUDGET_VALUE_COLUMN,
             "actual_book_keys": settings.ACTUAL_BOOK_KEYS,
             "budget_book_keys": settings.BUDGET_BOOK_KEYS,
-            "include_unmapped_accounts": settings.INCLUDE_UNMAPPED_ACCOUNTS,
+            "opex_sign_multiplier": settings.OPEX_SIGN_MULTIPLIER,
+            "opex_root_filter": settings.OPEX_ROOT_FILTER,
         },
         "tables": {},
         "gl_accounts": {},
@@ -789,8 +815,15 @@ def diagnostics() -> dict:
         "row_count": state["row_count"],
         "all_columns": state["all_columns"],
         "detected_columns": state["columns"],
-        "section_counts": state.get("section_counts", {}),
-        "sample": [{"GLAccountKey": k, **v} for k, v in list(state["lookup"].items())[:5]],
+        "accounts_per_line": {
+            label: state.get("line_counts", {}).get(key, 0)
+            for g in EXPENSE_GROUPS for key, label in g["items"]
+        },
+        "unassigned_group_accounts": state.get("line_counts", {}).get(UNASSIGNED_GROUP, 0),
+        "hierarchy_paths_per_line": {
+            label: state.get("line_paths", {}).get(key, [])
+            for g in EXPENSE_GROUPS for key, label in g["items"]
+        },
         "error": state["error"],
     }
 
