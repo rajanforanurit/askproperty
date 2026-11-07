@@ -26,20 +26,41 @@ def infer_focus(query: str, intent: str, parsed_focus: str = None, has_view: boo
     return "locate"
 
 
+SECTIONS = ("map", "financial", "properties")
+
+
 def sections_for(focus: str, intent: str, has_geography: bool, single_property: bool) -> list:
-    """Sections use the UI's names: map, financial, properties."""
+    """Whenever there is something to show, ALL sections are required. The model never decides this;
+    `focus` only says which one is emphasised, it never removes one."""
     if intent == "unknown":
         return []
-    if focus == "locate":
-        return ["map", "properties"]
-    if focus == "financial":
-        return ["financial", "properties"] + (["map"] if has_geography else [])
-    if focus in ("compare", "analysis"):
-        return ["map", "financial", "properties"]
-    return ["map", "properties"]
+    return list(SECTIONS)
 
 
 def classify(query: str, intent: str, parsed_focus: str = None, has_view: bool = False,
              has_geography: bool = False, single_property: bool = False) -> dict:
     focus = infer_focus(query, intent, parsed_focus, has_view)
     return {"focus": focus, "sections": sections_for(focus, intent, has_geography, single_property)}
+
+
+def enforce(layout: dict, response: dict) -> dict:
+    """Application-level completeness contract, applied to every response that has properties:
+    map + property list + expense comparison are always listed, and `complete` reports what is ready."""
+    rows = (response.get("table") or {}).get("rows") or []
+    if not rows:
+        return {"focus": layout.get("focus", ""), "sections": [], "complete": {}}
+    if response.get("financials"):
+        financial = "ready"
+    elif response.get("financials_error"):
+        financial = "error"
+    elif response.get("financials_pending"):
+        financial = "pending"
+    else:
+        financial = "missing"
+    location = response.get("location") or {}
+    mapped = int((response.get("task") or {}).get("plotted") or 0) > 0 or bool(location.get("origin"))
+    return {
+        "focus": layout.get("focus", ""),
+        "sections": list(SECTIONS),
+        "complete": {"map": mapped, "properties": True, "financial": financial},
+    }

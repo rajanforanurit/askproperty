@@ -498,6 +498,8 @@ def search(location_text: str, hint: Optional[str] = None, radius: Optional[floa
                 "message": "Only inactive or disposed properties match this location, so they are shown.",
             })
     info["matched_by"] = how
+    # A property sitting at the typed street address is the search's reference property.
+    info["matched_keys"] = [str(k) for k in matched["PropertyBizKey"].head(5)] if how == "address" and not matched.empty else []
     pool = everything if info["included_inactive"] else active
 
     # ---- resolve an origin when distance matters (radius / "near" / no exact match)

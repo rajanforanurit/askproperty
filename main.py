@@ -27,6 +27,7 @@ import errors
 import location_service
 import context_service
 import layout_service
+import selection_service
 from db import check_connection
 from config import settings, validate_secret_key_settings, validate_savechat_settings
 
@@ -92,6 +93,8 @@ class SelectionRequest(BaseModel):
     top_accounts: Optional[int] = None
     chart: Optional[str] = None
     chart_metric: Optional[str] = None
+    # The conversation state the client holds; returned updated so manual ticks stay part of the conversation.
+    context: Optional[dict] = None
 
 
 class SaveChatRequest(BaseModel):
@@ -278,11 +281,11 @@ def properties_in_area(
             info.update(status="empty", message=f"No properties were found in {name} or within {widest:g} miles of it.")
 
     plan = {
-        "intent": "list", "names": [], "view": None, "task_id": query_service.new_task_id(), "constraints": [],
+        "intent": "list", "names": [], "view": "actual", "task_id": query_service.new_task_id(), "constraints": [],
         "metric_constraints": [], "sort": None, "fields": [], "chart": None, "chart_metric": None,
         "display_metrics": [], "ym_from": None, "ym_to": None, "radius": None, "count": None,
         "ctx": None, "decision": {"use": "none", "new_topic": True, "refine": False},
-        "layout": {"focus": "locate", "sections": ["map", "properties"]},
+        "layout": {"focus": "locate", "sections": list(layout_service.SECTIONS)}, "operation": "new",
     }
     pool = [query_service.clean_record(r) for r in found.to_dict(orient="records")]
     if not pool:
@@ -619,21 +622,31 @@ def _build_plan(req: "AskAIRequest") -> dict:
     button_view = _resolve_view(req.view)
     ctx = context_service.clean(req.context)
     names_by_key = property_service.name_lookup() if ctx else {}
-    summary = context_service.prompt_summary(ctx, lambda k: names_by_key.get(str(k)))
+    hints = selection_service.mention_hints(req.query, ctx, names_by_key)
+    summary = context_service.prompt_summary(ctx, lambda k: names_by_key.get(str(k)), hints)
     llm_started = time.perf_counter()
     parsed = ai_service.resolve_intent(req.query, query_service.catalog_prompt(), summary)
     llm_ms = round((time.perf_counter() - llm_started) * 1000)
     intent = parsed["intent"]
     decision = context_service.decide(parsed, ctx, req.query)
+    operation = decision["operation"]
+    stateful = operation in context_service.STATE_OPERATIONS
     ctx_keys = context_service.keys_for(ctx, decision["use"])
     continuing = ctx is not None and not decision["new_topic"]
 
     raw_constraints = parsed.get("constraints")
     if decision["refine"] and ctx and ctx["constraints"]:
         raw_constraints = context_service.merge_constraints(ctx["constraints"], raw_constraints or [])
+    raw_metric_constraints = parsed.get("metric_constraints")
     location = parsed.get("location")
     if decision["refine"] and not location and ctx and ctx["location"]:
         location = {"text": ctx["location"]["requested"], "type": ctx["location"]["type"] or None}
+    if decision["use"] == "reference" and ctx:
+        # Distance follow-ups ("what about 15 miles?") re-measure from the ORIGINAL reference and keep the filters.
+        raw_constraints = context_service.merge_constraints(ctx["constraints"], raw_constraints or [])
+        raw_metric_constraints = context_service.merge_metric_constraints(ctx["metric_constraints"], raw_metric_constraints or [])
+        if not location and not ctx["reference_keys"] and ctx["location"]:
+            location = {"text": ctx["location"]["requested"], "type": ctx["location"]["type"] or None}
     if continuing and not parsed.get("period") and ctx and ctx["period"]:
         parsed["period"] = ctx["period"]
 
@@ -643,32 +656,36 @@ def _build_plan(req: "AskAIRequest") -> dict:
         radius = ctx["radius_miles"]
 
     layout = layout_service.classify(
-        req.query, intent, parsed.get("response_focus"),
+        req.query, intent, None,
         has_view=bool(button_view or parsed.get("data_view")),
         has_geography=bool(location or radius),
         single_property=len(parsed["property_names"]) == 1,
     )
     sections = list(layout["sections"])
-    view = button_view or parsed.get("data_view")
-    if view and "financial" not in sections and sections:
-        sections.insert(1 if sections[0] == "map" else 0, "financial")
-    if "financial" in sections and not view:
-        view = "actual"
-    if "financial" not in sections:
-        view = None
+    if stateful and not sections:
+        sections = list(layout_service.SECTIONS)
+    # Map, property list and expense comparison are always part of an answer; the model does not choose them.
+    view = button_view or parsed.get("data_view") or ("actual" if sections else None)
     layout = {"focus": layout["focus"], "sections": sections}
 
     constraints, flagged = query_service.sanitize_constraints(raw_constraints, parsed.get("unsupported"))
     fields, unsupported_fields = query_service.sanitize_fields(parsed.get("fields"))
     metric_keys, flagged_metrics = metric_service.sanitize_metrics(parsed.get("metrics"))
-    metric_constraints, flagged_metric_constraints = metric_service.sanitize_metric_constraints(parsed.get("metric_constraints"))
+    metric_constraints, flagged_metric_constraints = metric_service.sanitize_metric_constraints(raw_metric_constraints)
+    if stateful and ctx:
+        # Follow-ups keep showing what the conversation was already showing.
+        fields = fields or ctx["fields"]
+        metric_keys = metric_keys or [m for m in ctx["metrics"] if metric_service.resolve_metric(m)]
     sort, flagged_sort = metric_service.sanitize_sort(parsed.get("sort"))
     flagged = _dedupe(flagged + unsupported_fields + flagged_metrics + flagged_metric_constraints + flagged_sort)
 
     chart = visualization_service.resolve(req.query, parsed.get("visualization"), req.chart)
+    inherited_chart = None
+    if not chart and stateful and ctx and ctx["chart"] and not req.chart:
+        chart = inherited_chart = ctx["chart"].get("type")
     chart_metric = None
     if chart:
-        chart_metric = metric_service.resolve_metric(parsed.get("chart_metric"))
+        chart_metric = metric_service.resolve_metric(parsed.get("chart_metric") or (ctx["chart"].get("metric") if inherited_chart else None))
         if chart_metric is None:
             if sort:
                 chart_metric = sort["metric"]
@@ -709,6 +726,9 @@ def _build_plan(req: "AskAIRequest") -> dict:
         "decision": decision,
         "ctx_keys": ctx_keys,
         "layout": layout,
+        "operation": operation,
+        "edit_names": parsed.get("edit_names") or [],
+        "with_names": parsed.get("with_names") or [],
     }
 
 
@@ -875,14 +895,23 @@ def _collect_warnings(response: dict, extra: Optional[list] = None) -> list:
 
 
 def _finalize(response: dict, req: "AskAIRequest", plan: dict, reference_keys: list, result_keys: list,
-              location: Optional[dict] = None, warnings: Optional[list] = None) -> dict:
-    response["layout"] = plan["layout"]
+              location: Optional[dict] = None, warnings: Optional[list] = None,
+              pool_keys: Optional[list] = None, state_patch: Optional[dict] = None) -> dict:
     response["warnings"] = _collect_warnings(response, warnings)
     if location:
         response["location"] = location
-    response["context"] = context_service.next_context(
-        plan["ctx"], plan["decision"], req.query, plan, reference_keys, result_keys, location,
-    )
+    # An unsuccessful answer (nothing found, not understood, edit refused) never touches the saved state:
+    # the client keeps the last successful selection and can simply ask a corrected question.
+    failed = bool(response.get("code")) or not (response.get("table") or {}).get("rows")
+    response["layout"] = layout_service.enforce(plan["layout"], response)
+    if failed:
+        response["context"] = context_service.preserved(plan["ctx"])
+        response["state"] = {"committed": False}
+    else:
+        response["context"] = context_service.next_context(
+            plan["ctx"], plan["decision"], req.query, plan, reference_keys, result_keys, location, pool_keys, state_patch,
+        )
+        response["state"] = {"committed": True, "operation": plan.get("operation") or "new"}
     return response
 
 
@@ -921,6 +950,169 @@ def _empty_response(plan: dict, req: "AskAIRequest", code: str, message: str, in
     return _finalize(response, req, plan, [], [], location, warnings)
 
 
+def _fail(plan: dict, req: "AskAIRequest", code: str, message: str, unresolved: Optional[list] = None,
+          suggestions: Optional[list] = None) -> dict:
+    """An edit that could not be applied. The saved state is left exactly as it was."""
+    response = _empty_response(plan, req, code, message, "search")
+    response["unresolved"] = unresolved or []
+    if suggestions:
+        response["suggestions"] = suggestions
+    return response
+
+
+def _list_names(names: list) -> str:
+    names = [f"“{n}”" for n in names]
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def _kind_for(plan: dict, ctx: dict) -> str:
+    if plan["intent"] == "compare":
+        return "compare"
+    previous = ctx.get("intent") or "list"
+    return previous if previous in ("nearest", "compare") else "list"
+
+
+def _state_location(ctx: dict) -> Optional[dict]:
+    """Location block for a follow-up so the reference point stays on the map."""
+    origin = selection_service.origin_of(ctx)
+    if not origin:
+        return None
+    refs = property_service.get_many(ctx["reference_keys"])
+    point = ctx.get("reference_point") or {}
+    requested = (ctx["location"] or {}).get("requested") or (refs[0]["PropertyName"] if refs else point.get("label")) or "Reference"
+    return {
+        "requested": str(requested), "type": (ctx["location"] or {}).get("type") or "address", "status": "exact",
+        "message": None, "radius_miles": ctx["radius_miles"],
+        "origin": {"lat": origin[0], "lng": origin[1], "source": "state", "label": str(requested)},
+    }
+
+
+def _state_response(req: "AskAIRequest", plan: dict, ctx: dict, patch: dict, selected: list, message: str,
+                    applied: list, metric_applied: list, unsupported: list, notes: list, unresolved: list) -> dict:
+    """One response builder for every follow-up operation: reference + selection, always with the three sections."""
+    origin = selection_service.origin_of(ctx)
+    ref_keys = list(ctx["reference_keys"])
+    refs = selection_service.records_for(ref_keys, origin)
+    keys = ref_keys + [str(r["PropertyBizKey"]) for r in selected]
+    kind = _kind_for(plan, ctx)
+    financials, fin_notes = _financial_bundle(keys, plan["view"], req)
+    task = _task(plan, kind, None, refs + selected, "comparison" if kind == "compare" else "result",
+                 ctx["radius_miles"], None, applied, unsupported, notes + fin_notes, metric_applied)
+    pool = selection_service.records_for(patch["pool_keys"], origin)
+    full = _complete_pool(pool, anchors=refs, origin=origin, exclude=ref_keys)
+    selection = _selection_payload(plan, full, selected, ref_keys[0] if len(ref_keys) == 1 else None, ref_keys)
+    selection["selection"]["authoritative"] = True
+    response = {
+        "intent": "compare" if kind == "compare" else "search", "results": refs + selected, "references": refs,
+        "unresolved": unresolved, "message": message, **task, **financials, **selection,
+    }
+    _mark_references(response, ref_keys)
+    return _finalize(response, req, plan, ref_keys, keys, _state_location(ctx), None, patch["pool_keys"], patch)
+
+
+def _execute_state_operation(req: AskAIRequest, plan: dict):
+    """remove / add / replace / keep_only / refine / analyze / reset on the existing selection."""
+    ctx, op = plan["ctx"], plan["operation"]
+    if not ctx or not context_service.has_selection(ctx):
+        return _fail(plan, req, "no_context",
+                     "There are no results to change yet. Start with a search, for example “Find properties in Austin, TX”.")
+    universe = property_service.name_lookup()
+    refs = set(ctx["reference_keys"])
+    active = context_service.active_keys(ctx)
+    scope = {k: universe[k] for k in active if k in universe}
+    wide = {k: n for k, n in universe.items() if k not in refs}
+    unresolved, notes = [], []
+    constraints, metric_constraints = ctx["constraints"], ctx["metric_constraints"]
+    sort, count = ctx["sort"], ctx["count"]
+    applied, metric_applied, unsupported = [], [], list(plan["flagged"])
+    ym_from, ym_to = plan["ym_from"], plan["ym_to"]
+
+    remove_keys, add_keys = [], []
+    if op in context_service.EDIT_OPERATIONS:
+        removing = plan["edit_names"] if op in ("remove", "replace") else []
+        adding = plan["with_names"] if op == "replace" else plan["edit_names"] if op in ("add", "keep_only") else []
+        if not removing and not adding:
+            return _fail(plan, req, "not_understood", "I couldn't tell which properties you meant. Name the properties, for example “Remove Woodburn I”.")
+        mentions = []
+        if removing:
+            mentions += [("remove", m) for m in selection_service.resolve_names(removing, scope, universe, refs)]
+        if adding:
+            # Properties already selected are preferred, then everything else.
+            for text in adding:
+                mentions.append(("add", selection_service.resolve_preferring(text, scope, wide)))
+        for _side, m in mentions:
+            if m["status"] == "ambiguous":
+                options = " or ".join(f"“{c['name']}”" for c in m["candidates"][:4])
+                verb = {"remove": "Remove", "add": "Add", "replace": "Replace", "keep_only": "Keep only"}[op]
+                return _fail(plan, req, "ambiguous", f"“{m['text']}” could mean {options}. Which one do you mean?",
+                             [m["text"]], [{"label": f"{verb} {c['name']}", "text": f"{verb} {c['name']}"} for c in m["candidates"][:4]])
+            if m["status"] == "reference":
+                return _fail(plan, req, "reference_protected",
+                             f"{m['name']} is the reference property for this search, so it stays on the map and in the comparison. "
+                             "Start a new search to use a different reference.", [m["text"]])
+        for side, m in mentions:
+            if m["status"] == "resolved":
+                (remove_keys if side == "remove" else add_keys).append(m["key"])
+            elif m["status"] == "outside":
+                notes.append(f"{m['name']} is not in the current selection.")
+            else:
+                unresolved.append(m["text"])
+        remove_keys, add_keys = list(dict.fromkeys(remove_keys)), list(dict.fromkeys(add_keys))
+        needed = (op == "remove" and remove_keys) or (op in ("add", "keep_only") and add_keys) or (op == "replace" and remove_keys and add_keys)
+        if not needed:
+            label = _list_names(unresolved or plan["edit_names"] + plan["with_names"])
+            reason = f"“{label}” isn’t in the current selection." if notes and not unresolved else f"I couldn’t find a property matching {label}."
+            return _fail(plan, req, "no_match", reason + " Your selection is unchanged.", unresolved)
+        patch = selection_service.apply_edit(ctx, op, remove_keys, add_keys)
+        if op == "add":
+            already = [universe[k] for k in add_keys if k in active]
+            if already and len(already) == len(add_keys):
+                notes.append(f"{_list_names(already)} already in the selection.")
+        names_of = lambda ks: _list_names([universe[k] for k in ks if k in universe])
+        message = {
+            "remove": lambda: f"Removed {names_of(remove_keys)}.",
+            "add": lambda: f"Added {names_of(add_keys)}.",
+            "replace": lambda: f"Replaced {names_of(remove_keys)} with {names_of(add_keys)}.",
+            "keep_only": lambda: f"Showing only {names_of(add_keys)}.",
+        }[op]()
+        final_keys = [k for k in patch["result_keys"] if k not in refs]
+    elif op == "refine":
+        new_constraints, new_metric = plan["constraints"], plan["metric_constraints"]
+        if not (new_constraints or new_metric or plan["sort"] or plan["count"]):
+            text = "; ".join(plan["flagged"]) if plan["flagged"] else "that filter"
+            return _fail(plan, req, "unsupported_filter", f"I couldn’t apply {text}. Your selection is unchanged.")
+        constraints = context_service.merge_constraints(ctx["constraints"], new_constraints)
+        metric_constraints = context_service.merge_metric_constraints(ctx["metric_constraints"], new_metric)
+        sort, count = plan["sort"] or ctx["sort"], plan["count"] or ctx["count"]
+        found = selection_service.evaluate(ctx, constraints, metric_constraints, sort, count, ym_from, ym_to)
+        applied, metric_applied = found["applied"], found["metric_applied"]
+        unsupported = _dedupe(unsupported + found["unsupported"])
+        label = "; ".join(context_service.describe_filters(constraints, metric_constraints)) or "your request"
+        if not found["records"]:
+            return _fail(plan, req, "no_results", f"No properties in the current results match {label}. Your selection is unchanged.")
+        final_keys = [str(r["PropertyBizKey"]) for r in found["records"]]
+        patch = {"result_keys": ctx["reference_keys"] + final_keys}
+        message = f"{len(final_keys)} of {len(ctx['pool_keys']) - len(ctx['excluded_keys'])} properties match {label}."
+    elif op == "reset":
+        constraints, metric_constraints, sort, count = [], [], None, None
+        final_keys = [k for k in ctx["base_keys"] if k not in refs]
+        patch = {"result_keys": ctx["reference_keys"] + final_keys, "excluded_keys": []}
+        message = f"Restored the original results ({len(final_keys)} properties)."
+    else:  # analyze: same selection, new view of it
+        final_keys = active
+        patch = {"result_keys": list(ctx["result_keys"])}
+        message = f"Here is the comparison for the {len(final_keys)} selected {'property' if len(final_keys) == 1 else 'properties'}."
+
+    origin = selection_service.origin_of(ctx)
+    selected = selection_service.records_for(final_keys, origin, sort, ym_from, ym_to)
+    patch.update({"constraints": constraints, "metric_constraints": metric_constraints, "sort": sort, "count": count})
+    patch.setdefault("pool_keys", ctx["pool_keys"])
+    patch.setdefault("excluded_keys", ctx["excluded_keys"])
+    if unresolved:
+        notes.append(f"Couldn't match: {', '.join(unresolved)}.")
+    return _state_response(req, plan, ctx, patch, selected, message, applied, metric_applied, unsupported, notes, unresolved)
+
+
 def _execute_location(req: AskAIRequest, plan: dict):
     intent = plan["intent"]
     wanted = plan["location"]
@@ -955,9 +1147,15 @@ def _execute_location(req: AskAIRequest, plan: dict):
         records = [query_service.clean_record(r) for r in frame.to_dict(orient="records")]
 
     radius_driven = bool(plan["radius"]) and info["status"] == "exact"
-    pool = records
+    # A property at the typed street address is the REFERENCE: pinned, never part of the removable selection.
+    ref_keys = [str(k) for k in (info.get("matched_keys") or [])]
+    by_key = {str(r["PropertyBizKey"]): r for r in records}
+    ref_records = [by_key[k] if k in by_key else query_service.clean_record(property_service.get_by_bizkey(k))
+                   for k in ref_keys if k in by_key or property_service.get_by_bizkey(k) is not None]
+    ref_keys = [str(r["PropertyBizKey"]) for r in ref_records]
+    pool = [r for r in records if str(r["PropertyBizKey"]) not in set(ref_keys)]
     selected = _initial_selection(plan, pool, radius_driven)
-    keys = [str(r["PropertyBizKey"]) for r in selected]
+    keys = ref_keys + [str(r["PropertyBizKey"]) for r in selected]
     financials, fin_notes = _financial_bundle(keys, plan["view"], req)
     unsupported = _dedupe(plan["flagged"] + applied_holder["unsupported"])
     applied_all = applied_holder["applied"] + applied_holder["metric_applied"]
@@ -966,13 +1164,18 @@ def _execute_location(req: AskAIRequest, plan: dict):
         notes.insert(0, info["message"])
     if len(pool) > len(selected):
         notes.append(f"{len(pool)} properties found; {len(selected)} are selected. Tick others to add them.")
-    task = _task(plan, "list", None, selected, "result", plan["radius"], plan["count"],
+    if ref_records and not pool:
+        notes = [n for n in notes if not n.startswith("No properties matched")]
+    task = _task(plan, "list", None, ref_records + selected, "result", plan["radius"], plan["count"],
                  applied_holder["applied"], unsupported, notes, applied_holder["metric_applied"])
     origin = info.get("origin")
-    full = _complete_pool(pool, origin=(origin["lat"], origin["lng"]) if origin else None)
-    selection = _selection_payload(plan, full, selected)
-    response = {"intent": "search", "results": selected, "unresolved": [], **task, **financials, **selection}
-    return _finalize(response, req, plan, [], keys, info, warnings)
+    full = _complete_pool(pool, anchors=ref_records, origin=(origin["lat"], origin["lng"]) if origin else None, exclude=ref_keys)
+    selection = _selection_payload(plan, full, selected, ref_keys[0] if len(ref_keys) == 1 else None, ref_keys)
+    response = {"intent": "search", "results": ref_records + selected, "unresolved": [], **task, **financials, **selection}
+    if ref_records:
+        response["references"] = ref_records
+        _mark_references(response, ref_keys)
+    return _finalize(response, req, plan, ref_keys, keys, info, warnings, [str(r["PropertyBizKey"]) for r in pool])
 
 
 def _reference_response(req: AskAIRequest, plan: dict, kind: str, refs: list, pool: list, radius: float,
@@ -1009,7 +1212,7 @@ def _reference_response(req: AskAIRequest, plan: dict, kind: str, refs: list, po
             "code": "no_nearby",
             "message": f"No eligible properties were found within {radius:g} miles of the selected properties.",
         })
-    return _finalize(response, req, plan, ref_keys, keys, None, warnings)
+    return _finalize(response, req, plan, ref_keys, keys, None, warnings, [str(p["PropertyBizKey"]) for p in pool])
 
 
 def _execute(req: AskAIRequest, plan: dict):
@@ -1028,6 +1231,9 @@ def _execute(req: AskAIRequest, plan: dict):
     ctx_keys = plan["ctx_keys"]
 
     generic_message = "I couldn't tell what you want to find. Try naming a property, a place (city, state, ZIP) or the conditions you care about."
+
+    if plan["operation"] in context_service.STATE_OPERATIONS:
+        return _execute_state_operation(req, plan)
 
     if intent == "unknown":
         return _finalize(_unknown_response(task_id, parsed, generic_message), req, plan, [], [])
@@ -1069,7 +1275,7 @@ def _execute(req: AskAIRequest, plan: dict):
             )
             selection = _selection_payload(plan, _complete_pool(pool), rows)
             response = {"intent": "search", "results": rows, "unresolved": [], **task, **financials, **selection}
-            return _finalize(response, req, plan, [], keys)
+            return _finalize(response, req, plan, [], keys, pool_keys=[str(r["PropertyBizKey"]) for r in pool])
 
     if intent != "list" and not names and not ctx_keys and not context_key:
         return _finalize(_unknown_response(task_id, parsed, generic_message), req, plan, [], [])
@@ -1202,7 +1408,7 @@ def _execute(req: AskAIRequest, plan: dict):
             "code": "no_nearby",
             "message": f"No eligible properties were found{where} of the selected property.",
         })
-    return _finalize(response, req, plan, [target_key], all_keys, None, warnings)
+    return _finalize(response, req, plan, [target_key], all_keys, None, warnings, [str(p["PropertyBizKey"]) for p in pool])
 
 
 _SELECTION_ROLES = {"nearest": "nearby", "compare": "comparison", "list": "result", "search": "result"}
@@ -1211,6 +1417,15 @@ _SELECTION_ROLES = {"nearest": "nearby", "compare": "comparison", "list": "resul
 @app.post("/properties/selection", dependencies=[Depends(verify_secret_key)])
 def update_selection(req: SelectionRequest):
     """Rebuild map markers, table, comparison and financials for the current checkbox selection."""
+    response = _update_selection(req)
+    ctx = context_service.clean(req.context)
+    if ctx and isinstance(response, dict):
+        chosen = (response.get("selection") or {}).get("selected_keys")
+        response["context"] = context_service.after_manual_selection(ctx, chosen if chosen is not None else req.biz_keys)
+    return response
+
+
+def _update_selection(req: SelectionRequest):
     kind = (req.kind or "compare").strip().lower()
     if kind not in _SELECTION_ROLES:
         raise HTTPException(status_code=400, detail=f"Unsupported kind '{req.kind}'.")

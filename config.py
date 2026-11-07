@@ -92,6 +92,9 @@ class Settings:
     # Optional JSON merged into the model request, e.g. {"reasoning_effort":"low"} or
     # {"response_format":{"type":"json_object"}}. Empty = send nothing extra (previous behaviour).
     ASK_AI_EXTRA_PARAMS: str = os.getenv("ASK_AI_EXTRA_PARAMS", "").strip()
+    # How the model is asked for structured output: "prompt" (JSON described in the prompt, validated by the
+    # backend; works with any model), "json_object" (response_format) or "tools" (forced function call).
+    ASK_AI_OUTPUT_MODE: str = os.getenv("ASK_AI_OUTPUT_MODE", "prompt").strip().lower()
     # Seconds an identical question (same conversation context) reuses the parsed intent. 0 disables.
     INTENT_CACHE_TTL_SECONDS: int = int(os.getenv("INTENT_CACHE_TTL_SECONDS", "600"))
     INTENT_CACHE_MAX_ENTRIES: int = int(os.getenv("INTENT_CACHE_MAX_ENTRIES", "256"))
