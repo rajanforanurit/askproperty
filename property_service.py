@@ -1,5 +1,6 @@
 import logging
 import difflib
+import re
 from typing import Optional
 
 import pandas as pd
@@ -83,25 +84,98 @@ def name_lookup() -> dict:
     return dict(zip(df["PropertyBizKey"].astype(str), df["PropertyName"].astype(str)))
 
 
+# Words that appear in many property names and say nothing about WHICH property is meant.
+# "ganga apartment" must not match "Lotus Apartments" just because of the shared generic word.
+_GENERIC_TOKENS = {
+    "apartment", "apartments", "apt", "apts", "the", "at", "of", "and", "on", "in", "by",
+    "residence", "residences", "residential", "villa", "villas", "homes", "home", "living",
+    "community", "communities", "property", "properties", "place", "flats", "flat",
+    "condo", "condos", "townhomes", "townhome", "lofts", "loft", "village", "estates", "estate",
+}
+_TOKEN_SPLIT = re.compile(r"[^a-z0-9]+")
+
+
+def _tokens(value) -> list:
+    return [t for t in _TOKEN_SPLIT.split(str(value or "").lower()) if t]
+
+
+def _is_generic(token: str) -> bool:
+    if token in _GENERIC_TOKENS:
+        return True
+    # "apartmnts", "apartmentz" and similar typos of a generic word are still generic.
+    return len(token) >= 6 and any(
+        len(g) >= 6 and difflib.SequenceMatcher(None, token, g).ratio() >= 0.85 for g in _GENERIC_TOKENS
+    )
+
+
+def _distinctive(tokens: list) -> list:
+    core = [t for t in tokens if not _is_generic(t)]
+    return core or tokens
+
+
+def _token_close(a: str, b: str) -> bool:
+    """Same word, allowing one small typo. Very short words must match exactly."""
+    if a == b:
+        return True
+    if min(len(a), len(b)) < 4 or abs(len(a) - len(b)) > 2:
+        return False
+    return difflib.SequenceMatcher(None, a, b).ratio() >= 0.85
+
+
+def _fuzzy_name_matches(query: str, df: pd.DataFrame, limit: int) -> pd.DataFrame:
+    """Typo-tolerant match that never lets a generic shared word stand in for the real name.
+
+    Every distinctive word the user typed must match a distinctive word of the property name
+    (exactly, or within one small typo). One wrong distinctive word rejects the property.
+    """
+    wanted = _distinctive(_tokens(query))
+    if not wanted:
+        return df.iloc[0:0]
+    scored = []
+    for idx, name in df["PropertyName"].items():
+        have = _distinctive(_tokens(name))
+        if not have:
+            continue
+        total = 0.0
+        for w in wanted:
+            best = max((difflib.SequenceMatcher(None, w, h).ratio() for h in have if _token_close(w, h)), default=0.0)
+            if best == 0.0:
+                total = 0.0
+                break
+            total += best
+        if total:
+            scored.append((total / len(wanted), idx))
+    if not scored:
+        return df.iloc[0:0]
+    scored.sort(key=lambda x: -x[0])
+    return df.loc[[i for _, i in scored[:limit]]]
+
+
 def search_by_name(query: str, limit: int = 5, active_only: bool = False) -> list[dict]:
     df = get_all_properties(active_only=True) if active_only else _frame()
-    query_norm = query.strip().lower()
+    query_norm = (query or "").strip().lower()
+    if not query_norm:
+        return []
 
-    exact = df[df["PropertyName"].str.lower() == query_norm]
+    names = df["PropertyName"].str.lower()
+
+    exact = df[names == query_norm]
     if not exact.empty:
         return exact.head(limit).to_dict(orient="records")
 
-    substring = df[df["PropertyName"].str.lower().str.contains(query_norm, na=False, regex=False)]
+    substring = df[names.str.contains(query_norm, na=False, regex=False)]
     if not substring.empty:
         return substring.head(limit).to_dict(orient="records")
 
-    all_names = df["PropertyName"].tolist()
-    close = difflib.get_close_matches(query, all_names, n=limit, cutoff=0.6)
-    if close:
-        matched = df[df["PropertyName"].isin(close)]
-        return matched.head(limit).to_dict(orient="records")
+    # Same name written with different punctuation/spacing ("Lake-View" vs "Lake View").
+    canon_q = re.sub(r"[^a-z0-9]", "", query_norm)
+    if canon_q:
+        canon = df[names.str.replace(r"[^a-z0-9]", "", regex=True) == canon_q]
+        if not canon.empty:
+            return canon.head(limit).to_dict(orient="records")
 
-    return []
+    fuzzy = _fuzzy_name_matches(query, df, limit)
+    return fuzzy.to_dict(orient="records") if not fuzzy.empty else []
 
 
 def refresh_now():
