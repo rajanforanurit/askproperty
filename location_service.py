@@ -1,9 +1,4 @@
-"""Location understanding for property search.
-
-Pipeline: classify the requested location -> match it against the property table ->
-resolve coordinates (geocoder, then database evidence) -> fall back to nearby properties.
-A geocoder failure is never reported as "no properties".
-"""
+import difflib
 import logging
 import re
 import time
@@ -46,6 +41,29 @@ STREET_WORDS = {
 ZIP_RE = re.compile(r"\b(\d{5})(?:-\d{4})?\b")
 PROXIMITY_RE = re.compile(r"\b(near|nearby|around|close to|closest to|nearest to|next to|surrounding|in the vicinity of)\b", re.IGNORECASE)
 STREET_RE = re.compile(r"^\s*\d+[a-z]?\s+\S+")
+
+# Words that mark the text as a property NAME ("Ganga Apartments"), not a geographic place.
+_PROPERTY_WORDS = {
+    "apartment", "apartments", "apt", "apts", "residence", "residences", "villa", "villas",
+    "condo", "condos", "townhome", "townhomes", "flats", "lofts", "communities", "community",
+}
+
+
+def looks_like_property_name(text: str) -> bool:
+    """True for text such as "gange apartments" that names a building rather than a place.
+
+    Such text must be resolved against the property table only. Sending it to a geocoder
+    returns some unrelated place with a similar sound (e.g. "gange" -> Gandy Beach) and then
+    shows whatever property happens to be nearby.
+    """
+    for token in re.findall(r"[a-z]+", str(text or "").lower()):
+        if token in _PROPERTY_WORDS:
+            return True
+        if len(token) >= 6 and any(
+            len(w) >= 6 and difflib.SequenceMatcher(None, token, w).ratio() >= 0.85 for w in _PROPERTY_WORDS
+        ):
+            return True
+    return False
 
 
 def _norm_text(value) -> str:
@@ -498,8 +516,24 @@ def search(location_text: str, hint: Optional[str] = None, radius: Optional[floa
                 "message": "Only inactive or disposed properties match this location, so they are shown.",
             })
     info["matched_by"] = how
-    # A property sitting at the typed street address is the search's reference property.
-    info["matched_keys"] = [str(k) for k in matched["PropertyBizKey"].head(5)] if how == "address" and not matched.empty else []
+
+    # ---- a building name that is not in the data: never guess a place for it
+    if matched.empty and not loc.get("zip") and not loc.get("street") and looks_like_property_name(loc["raw"]):
+        hits = property_service.search_by_name(loc["raw"], limit=10)
+        if hits:
+            hit_df = pd.DataFrame(hits)
+            if constraint_fn:
+                hit_df = constraint_fn(hit_df)
+            if not hit_df.empty:
+                info["matched_by"] = "name"
+                return finish("exact", None, _records(hit_df.sort_values("PropertyName")))
+        return finish(
+            "unresolved",
+            f'No property named "{loc["raw"]}" was found in your portfolio. '
+            "Check the spelling, or search by city, state or ZIP code.",
+            [],
+        )
+
     pool = everything if info["included_inactive"] else active
 
     # ---- resolve an origin when distance matters (radius / "near" / no exact match)
